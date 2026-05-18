@@ -47,7 +47,15 @@ hyprctl clients
 
 ## Installation
 
-Build from source:
+### AUR
+
+```sh
+paru -S hypr-kblayoutd-git
+# or
+yay -S hypr-kblayoutd-git
+```
+
+### Build from source
 
 ```sh
 cargo build --release
