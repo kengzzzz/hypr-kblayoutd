@@ -64,7 +64,7 @@ cargo build --release
 Run from `hyprland.conf`:
 
 ```text
-exec-once = /path/to/hypr-kblayoutd/target/release/hypr-kblayoutd
+exec-once = hypr-kblayoutd
 ```
 
 Hyprland must have at least two keyboard layouts configured, unless you use `input:kb_file`.
