@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use regex_lite::Regex;
+
 use crate::config::Config;
 use crate::event::Event;
 
@@ -31,12 +33,14 @@ pub struct RuntimeState {
     configured_keyboards: bool,
     exclude_contains: Vec<String>,
     defaults_by_class: HashMap<String, LayoutIndex>,
+    default_patterns: Vec<(Regex, LayoutIndex)>,
     pending_echoes: HashMap<String, u8>,
 }
 
 impl RuntimeState {
     pub fn new(config: Config, active_layout: LayoutIndex) -> Self {
         let configured_keyboards = !config.keyboards.include.is_empty();
+        let default_patterns = compile_default_patterns(&config.default_layouts);
         Self {
             windows: HashMap::new(),
             active_window: None,
@@ -46,6 +50,7 @@ impl RuntimeState {
             configured_keyboards,
             exclude_contains: config.keyboards.exclude_contains,
             defaults_by_class: config.default_layouts,
+            default_patterns,
             pending_echoes: HashMap::new(),
         }
     }
@@ -234,7 +239,14 @@ impl RuntimeState {
         let Some(class_name) = &self.active_class else {
             return 0;
         };
-        self.defaults_by_class.get(class_name).copied().unwrap_or(0)
+        if let Some(layout) = self.defaults_by_class.get(class_name) {
+            return *layout;
+        }
+        self.default_patterns
+            .iter()
+            .find(|(pattern, _)| pattern.is_match(class_name))
+            .map(|(_, layout)| *layout)
+            .unwrap_or(0)
     }
 
     fn is_managed_keyboard(&self, keyboard: &str) -> bool {
@@ -247,6 +259,30 @@ impl RuntimeState {
             .iter()
             .any(|fragment| !fragment.is_empty() && keyboard.contains(fragment))
     }
+}
+
+// Every configured class is also usable as an anchored regex, matched only
+// when no exact entry fits. Sorted by pattern text so overlapping patterns
+// resolve the same way on every run. Keys that fail to compile (stray
+// parens etc.) still work as exact matches, so this never rejects a config.
+fn compile_default_patterns(defaults: &HashMap<String, LayoutIndex>) -> Vec<(Regex, LayoutIndex)> {
+    let mut entries: Vec<(&String, LayoutIndex)> = defaults
+        .iter()
+        .map(|(key, layout)| (key, *layout))
+        .collect();
+    entries.sort();
+    entries
+        .into_iter()
+        .filter_map(|(key, layout)| match Regex::new(&format!("^(?:{key})$")) {
+            Ok(pattern) => Some((pattern, layout)),
+            Err(err) => {
+                log::debug!(
+                    "default_layouts key {key:?} is not a valid regex ({err}); exact match only"
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 impl fmt::Display for WindowAddr {
@@ -290,6 +326,64 @@ mod tests {
                 previous: 0
             }]
         );
+        assert_eq!(state.active_window_layout(), Some(1));
+    }
+
+    #[test]
+    fn new_window_matches_class_default_as_regex() {
+        let mut state = RuntimeState::new(config(&["kbd"], &[("chrome-.*whatsapp.*", 1)]), 0);
+        state.handle_event(Event::ActiveWindow {
+            class_name: "chrome-web.whatsapp.com__-Default",
+        });
+
+        assert_eq!(
+            state.handle_event(Event::ActiveWindowV2 {
+                addr: WindowAddr(1)
+            }),
+            vec![Action::SwitchLayout {
+                keyboards: vec!["kbd".to_string()],
+                layout: 1,
+                previous: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn exact_class_default_wins_over_pattern() {
+        let mut state = RuntimeState::new(config(&["kbd"], &[("fire.*", 1), ("firefox", 2)]), 0);
+        state.handle_event(Event::ActiveWindow {
+            class_name: "firefox",
+        });
+        state.handle_event(Event::ActiveWindowV2 {
+            addr: WindowAddr(1),
+        });
+
+        assert_eq!(state.active_window_layout(), Some(2));
+    }
+
+    #[test]
+    fn pattern_matches_whole_class_only() {
+        let mut state = RuntimeState::new(config(&["kbd"], &[("firefox", 1)]), 0);
+        state.handle_event(Event::ActiveWindow {
+            class_name: "firefox-nightly",
+        });
+        state.handle_event(Event::ActiveWindowV2 {
+            addr: WindowAddr(1),
+        });
+
+        assert_eq!(state.active_window_layout(), Some(0));
+    }
+
+    #[test]
+    fn invalid_regex_key_still_matches_exactly() {
+        let mut state = RuntimeState::new(config(&["kbd"], &[("app(broken", 1)]), 0);
+        state.handle_event(Event::ActiveWindow {
+            class_name: "app(broken",
+        });
+        state.handle_event(Event::ActiveWindowV2 {
+            addr: WindowAddr(1),
+        });
+
         assert_eq!(state.active_window_layout(), Some(1));
     }
 

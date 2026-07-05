@@ -34,6 +34,10 @@ exclude_contains = ["wlr_virtual_keyboard_v", "yubikey"]
 "org.telegram.desktop" = 1
 "discord" = 1
 "firefox" = 0
+
+# Keys are also regexes (matched against the whole class), like Hyprland
+# window rules. Exact entries win over patterns. Handy for Chrome PWAs:
+"chrome-.*whatsapp.*" = 1
 ```
 
 Layout indexes follow Hyprland's `input:kb_layout` order. For example, `kb_layout = us,th` means `us` is `0` and `th` is `1`.
