@@ -71,6 +71,20 @@ Run from `hyprland.conf`:
 exec-once = hypr-kblayoutd
 ```
 
+### systemd user unit (uwsm)
+
+If you run Hyprland under uwsm, use the shipped user unit instead of `exec-once`:
+
+```sh
+systemctl --user enable --now hypr-kblayoutd.service
+```
+
+The AUR package installs the unit. When building from source, install it manually first (adjust `ExecStart` if the binary is not in `/usr/bin`):
+
+```sh
+install -Dm644 contrib/hypr-kblayoutd.service ~/.config/systemd/user/hypr-kblayoutd.service
+```
+
 Hyprland must have at least two keyboard layouts configured, unless you use `input:kb_file`.
 
 ## Logging

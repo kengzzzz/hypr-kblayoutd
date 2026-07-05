@@ -45,6 +45,9 @@ package() {
   install -Dm755 "target/release/$_pkgname" \
     "$pkgdir/usr/bin/$_pkgname"
 
+  install -Dm644 contrib/hypr-kblayoutd.service \
+    "$pkgdir/usr/lib/systemd/user/$_pkgname.service"
+
   install -Dm644 README.md \
     "$pkgdir/usr/share/doc/$pkgname/README.md"
 
