@@ -7,8 +7,8 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::event::parse_layout_index;
-use crate::state::LayoutIndex;
+use crate::event::{parse_layout_index, parse_window_addr};
+use crate::state::{LayoutIndex, WindowAddr};
 
 #[derive(Debug)]
 pub enum IpcError {
@@ -17,6 +17,8 @@ pub enum IpcError {
     Json(serde_json::Error),
     MissingKeyboard(String),
     InvalidLayoutIndex(u64),
+    CommandFailed(String),
+    BadWindowAddress(String),
 }
 
 impl fmt::Display for IpcError {
@@ -31,6 +33,12 @@ impl fmt::Display for IpcError {
                     f,
                     "Hyprland returned layout index {index}, which is too large"
                 )
+            }
+            Self::CommandFailed(response) => {
+                write!(f, "Hyprland rejected the command: {response}")
+            }
+            Self::BadWindowAddress(addr) => {
+                write!(f, "Hyprland returned unparsable window address {addr:?}")
             }
         }
     }
@@ -52,6 +60,7 @@ impl From<serde_json::Error> for IpcError {
 
 #[derive(Debug, Clone)]
 pub struct HyprlandPaths {
+    pub signature: String,
     pub command_socket: PathBuf,
     pub event_socket: PathBuf,
 }
@@ -81,6 +90,19 @@ struct KeyboardResponse {
     main: bool,
 }
 
+// `j/activewindow` returns `{}` when nothing is focused.
+#[derive(Debug, Deserialize)]
+struct ActiveWindowResponse {
+    address: Option<String>,
+    #[serde(default)]
+    class: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientResponse {
+    address: String,
+}
+
 impl HyprlandPaths {
     pub fn discover() -> Result<Self, IpcError> {
         let signature = env::var("HYPRLAND_INSTANCE_SIGNATURE")
@@ -94,6 +116,7 @@ impl HyprlandPaths {
             .unwrap_or(fallback);
 
         Ok(Self {
+            signature,
             command_socket: base.join(".socket.sock"),
             event_socket: base.join(".socket2.sock"),
         })
@@ -127,11 +150,11 @@ impl HyprlandIpc {
 
     pub fn switch_layout(&self, keyboard: &str, layout: LayoutIndex) -> Result<(), IpcError> {
         let output = self.command(&switch_layout_command(keyboard, layout))?;
-        if output.trim() == "ok" || output.trim().is_empty() {
+        let response = output.trim();
+        if response == "ok" || response.is_empty() {
             Ok(())
         } else {
-            log::debug!("switchxkblayout response for {keyboard}: {}", output.trim());
-            Ok(())
+            Err(IpcError::CommandFailed(response.to_string()))
         }
     }
 
@@ -167,7 +190,27 @@ impl HyprlandIpc {
             .ok_or(IpcError::InvalidLayoutIndex(keyboard.active_layout_index))
     }
 
-    pub fn initial_active_layout(&self) -> Result<LayoutIndex, IpcError> {
+    pub fn active_window(&self) -> Result<Option<(WindowAddr, String)>, IpcError> {
+        let response: ActiveWindowResponse = self.json_command("j/activewindow")?;
+        let Some(address) = response.address else {
+            return Ok(None);
+        };
+        let addr = parse_window_addr(&address).map_err(|_| IpcError::BadWindowAddress(address))?;
+        Ok(Some((addr, response.class.unwrap_or_default())))
+    }
+
+    pub fn client_addresses(&self) -> Result<Vec<WindowAddr>, IpcError> {
+        let clients: Vec<ClientResponse> = self.json_command("j/clients")?;
+        clients
+            .into_iter()
+            .map(|client| {
+                parse_window_addr(&client.address)
+                    .map_err(|_| IpcError::BadWindowAddress(client.address))
+            })
+            .collect()
+    }
+
+    pub fn current_active_layout(&self) -> Result<LayoutIndex, IpcError> {
         let devices: DevicesResponse = self.json_command("j/devices")?;
         let keyboard = devices
             .keyboards

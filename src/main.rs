@@ -19,9 +19,9 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let _instance = SingleInstance::acquire("hypr-kblayoutd")?;
-    let config = config::load_default()?;
     let paths = HyprlandPaths::discover()?;
+    let _instance = SingleInstance::acquire(&format!("hypr-kblayoutd-{}", paths.signature))?;
+    let config = config::load_default()?;
     let ipc = HyprlandIpc::new(paths);
 
     let layout_count = ipc.configured_layout_count()?;
@@ -29,7 +29,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Hyprland needs at least two configured keyboard layouts".into());
     }
 
-    let initial_layout = ipc.initial_active_layout()?;
+    let initial_layout = ipc.current_active_layout()?;
     let mut state = RuntimeState::new(config, initial_layout);
     listen_forever(&ipc, &mut state)
 }
@@ -41,6 +41,8 @@ fn listen_forever(
     let mut backoff = Duration::from_millis(100);
 
     loop {
+        resync_state(ipc, state);
+
         match listen_once(ipc, state) {
             Ok(()) => log::warn!("Hyprland event socket closed; reconnecting"),
             Err(err) => log::warn!("Hyprland event socket error: {err}; reconnecting"),
@@ -48,6 +50,24 @@ fn listen_forever(
 
         thread::sleep(backoff);
         backoff = (backoff * 2).min(Duration::from_secs(5));
+    }
+}
+
+// Events can be missed at startup and while the event socket is down, so
+// re-align window/layout state with Hyprland before (re)attaching.
+fn resync_state(ipc: &HyprlandIpc, state: &mut RuntimeState) {
+    let queried = ipc.current_active_layout().and_then(|layout| {
+        let active = ipc.active_window()?;
+        let clients = ipc.client_addresses()?;
+        Ok((layout, active, clients))
+    });
+
+    match queried {
+        Ok((layout, active, clients)) => {
+            let actions = state.resync(active, layout, &clients);
+            run_actions(ipc, state, actions);
+        }
+        Err(err) => log::warn!("state resync skipped: {err}"),
     }
 }
 
@@ -76,11 +96,23 @@ fn listen_once(ipc: &HyprlandIpc, state: &mut RuntimeState) -> std::io::Result<(
 fn run_actions(ipc: &HyprlandIpc, state: &mut RuntimeState, actions: Vec<Action>) {
     for action in actions {
         match action {
-            Action::SwitchLayout { keyboards, layout } => {
+            Action::SwitchLayout {
+                keyboards,
+                layout,
+                previous,
+            } => {
+                let mut any_switched = false;
                 for keyboard in keyboards {
-                    if let Err(err) = ipc.switch_layout(&keyboard, layout) {
-                        log::warn!("failed to switch {keyboard} to layout {layout}: {err}");
+                    match ipc.switch_layout(&keyboard, layout) {
+                        Ok(()) => any_switched = true,
+                        Err(err) => {
+                            log::warn!("failed to switch {keyboard} to layout {layout}: {err}");
+                            state.switch_failed(&keyboard);
+                        }
                     }
+                }
+                if !any_switched {
+                    state.set_active_layout(previous);
                 }
             }
             Action::QueryKeyboardLayout { keyboard } => {

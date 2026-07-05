@@ -14,6 +14,7 @@ pub enum Action {
     SwitchLayout {
         keyboards: Vec<String>,
         layout: LayoutIndex,
+        previous: LayoutIndex,
     },
     QueryKeyboardLayout {
         keyboard: String,
@@ -30,6 +31,7 @@ pub struct RuntimeState {
     configured_keyboards: bool,
     exclude_contains: Vec<String>,
     defaults_by_class: HashMap<String, LayoutIndex>,
+    pending_echoes: HashMap<String, u8>,
 }
 
 impl RuntimeState {
@@ -44,6 +46,7 @@ impl RuntimeState {
             configured_keyboards,
             exclude_contains: config.keyboards.exclude_contains,
             defaults_by_class: config.default_layouts,
+            pending_echoes: HashMap::new(),
         }
     }
 
@@ -54,7 +57,11 @@ impl RuntimeState {
                 Vec::new()
             }
             Event::ActiveWindowV2 { addr } => self.activate_window(addr),
-            Event::EmptyActiveWindow => Vec::new(),
+            Event::EmptyActiveWindow => {
+                self.active_window = None;
+                self.active_class = None;
+                Vec::new()
+            }
             Event::CloseWindow { addr } => {
                 self.windows.remove(&addr);
                 Vec::new()
@@ -99,6 +106,43 @@ impl RuntimeState {
         &self.keyboards
     }
 
+    /// Re-align state with Hyprland after events may have been missed
+    /// (startup, or a gap while the event socket was down).
+    pub fn resync(
+        &mut self,
+        active: Option<(WindowAddr, String)>,
+        actual_layout: LayoutIndex,
+        live_windows: &[WindowAddr],
+    ) -> Vec<Action> {
+        self.windows.retain(|addr, _| live_windows.contains(addr));
+        self.pending_echoes.clear();
+        self.active_layout = actual_layout;
+
+        let Some((addr, class_name)) = active else {
+            self.active_window = None;
+            self.active_class = None;
+            return Vec::new();
+        };
+
+        self.active_window = Some(addr);
+        self.active_class = Some(class_name);
+        match self.windows.get(&addr).copied() {
+            Some(remembered) => {
+                log::debug!(
+                    "resync: restoring known window: address={addr} target_layout={remembered} actual_layout={actual_layout}"
+                );
+                self.switch_actions(remembered)
+            }
+            None => {
+                // Window appeared while we were disconnected; adopt whatever
+                // the user is currently typing with instead of forcing a default.
+                self.windows.insert(addr, actual_layout);
+                log::debug!("resync: learned window: address={addr} layout={actual_layout}");
+                Vec::new()
+            }
+        }
+    }
+
     fn activate_window(&mut self, addr: WindowAddr) -> Vec<Action> {
         self.active_window = Some(addr);
         let previous = self.active_layout;
@@ -128,6 +172,10 @@ impl RuntimeState {
             log::debug!("keyboard skipped due to exclude rule: keyboard={keyboard}");
             return Vec::new();
         }
+        if self.consume_pending_echo(keyboard) {
+            log::debug!("own layout switch echoed back, ignored: keyboard={keyboard}");
+            return Vec::new();
+        }
         if self.configured_keyboards {
             if !self.keyboards.iter().any(|known| known == keyboard) {
                 log::debug!("keyboard skipped due to include rule: keyboard={keyboard}");
@@ -155,11 +203,31 @@ impl RuntimeState {
             self.active_layout = target;
             return Vec::new();
         }
+        let previous = self.active_layout;
         self.active_layout = target;
+        for keyboard in &self.keyboards {
+            *self.pending_echoes.entry(keyboard.clone()).or_insert(0) += 1;
+        }
         vec![Action::SwitchLayout {
             keyboards: self.keyboards.clone(),
             layout: target,
+            previous,
         }]
+    }
+
+    pub fn switch_failed(&mut self, keyboard: &str) {
+        self.consume_pending_echo(keyboard);
+    }
+
+    fn consume_pending_echo(&mut self, keyboard: &str) -> bool {
+        let Some(count) = self.pending_echoes.get_mut(keyboard) else {
+            return false;
+        };
+        *count -= 1;
+        if *count == 0 {
+            self.pending_echoes.remove(keyboard);
+        }
+        true
     }
 
     fn default_layout_for_active_class(&self) -> LayoutIndex {
@@ -218,7 +286,8 @@ mod tests {
             }),
             vec![Action::SwitchLayout {
                 keyboards: vec!["kbd".to_string()],
-                layout: 1
+                layout: 1,
+                previous: 0
             }]
         );
         assert_eq!(state.active_window_layout(), Some(1));
@@ -241,7 +310,8 @@ mod tests {
             }),
             vec![Action::SwitchLayout {
                 keyboards: vec!["kbd".to_string()],
-                layout: 1
+                layout: 1,
+                previous: 0
             }]
         );
     }
@@ -316,7 +386,165 @@ mod tests {
             }),
             vec![Action::SwitchLayout {
                 keyboards: vec!["kbd".to_string()],
-                layout: 0
+                layout: 0,
+                previous: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn empty_active_window_clears_active_window() {
+        let mut state = RuntimeState::new(config(&["kbd"], &[]), 0);
+        state.handle_event(Event::ActiveWindowV2 {
+            addr: WindowAddr(1),
+        });
+        state.handle_event(Event::CloseWindow {
+            addr: WindowAddr(1),
+        });
+        state.handle_event(Event::EmptyActiveWindow);
+
+        // A manual layout change on an empty workspace must not resurrect
+        // the closed window's entry.
+        state.record_keyboard_layout("kbd", 1);
+
+        assert_eq!(
+            state.handle_event(Event::ActiveWindowV2 {
+                addr: WindowAddr(1)
+            }),
+            vec![Action::SwitchLayout {
+                keyboards: vec!["kbd".to_string()],
+                layout: 0,
+                previous: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn own_switch_echo_is_ignored_once() {
+        let mut state = RuntimeState::new(config(&["kbd"], &[("firefox", 1)]), 0);
+        state.handle_event(Event::ActiveWindow {
+            class_name: "firefox",
+        });
+        assert!(!state
+            .handle_event(Event::ActiveWindowV2 {
+                addr: WindowAddr(1)
+            })
+            .is_empty());
+
+        let echo = Event::ActiveLayout {
+            keyboard: "kbd",
+            layout_name: "Thai",
+        };
+        assert!(state.handle_event(echo.clone()).is_empty());
+        assert_eq!(
+            state.handle_event(echo),
+            vec![Action::QueryKeyboardLayout {
+                keyboard: "kbd".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn switch_failed_clears_pending_echo() {
+        let mut state = RuntimeState::new(config(&["kbd"], &[("firefox", 1)]), 0);
+        state.handle_event(Event::ActiveWindow {
+            class_name: "firefox",
+        });
+        state.handle_event(Event::ActiveWindowV2 {
+            addr: WindowAddr(1),
+        });
+        state.switch_failed("kbd");
+
+        assert_eq!(
+            state.handle_event(Event::ActiveLayout {
+                keyboard: "kbd",
+                layout_name: "English"
+            }),
+            vec![Action::QueryKeyboardLayout {
+                keyboard: "kbd".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn resync_prunes_closed_windows() {
+        let mut state = RuntimeState::new(config(&["kbd"], &[]), 0);
+        state.handle_event(Event::ActiveWindowV2 {
+            addr: WindowAddr(1),
+        });
+        state.record_keyboard_layout("kbd", 1);
+
+        assert!(state.resync(None, 0, &[]).is_empty());
+
+        // Window 1 is gone; re-seeing its address treats it as new.
+        assert!(state
+            .handle_event(Event::ActiveWindowV2 {
+                addr: WindowAddr(1)
+            })
+            .is_empty());
+        assert_eq!(state.active_window_layout(), Some(0));
+    }
+
+    #[test]
+    fn resync_restores_known_active_window() {
+        let mut state = RuntimeState::new(config(&["kbd"], &[]), 0);
+        state.handle_event(Event::ActiveWindowV2 {
+            addr: WindowAddr(1),
+        });
+        state.record_keyboard_layout("kbd", 1);
+
+        assert_eq!(
+            state.resync(
+                Some((WindowAddr(1), "firefox".to_string())),
+                0,
+                &[WindowAddr(1)]
+            ),
+            vec![Action::SwitchLayout {
+                keyboards: vec!["kbd".to_string()],
+                layout: 1,
+                previous: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn resync_learns_unknown_active_window_without_switching() {
+        let mut state = RuntimeState::new(config(&["kbd"], &[("firefox", 0)]), 0);
+
+        assert!(state
+            .resync(
+                Some((WindowAddr(7), "firefox".to_string())),
+                1,
+                &[WindowAddr(7)]
+            )
+            .is_empty());
+        assert_eq!(state.active_window_layout(), Some(1));
+        assert_eq!(state.active_layout(), 1);
+    }
+
+    #[test]
+    fn resync_clears_pending_echoes() {
+        let mut state = RuntimeState::new(config(&["kbd"], &[("firefox", 1)]), 0);
+        state.handle_event(Event::ActiveWindow {
+            class_name: "firefox",
+        });
+        state.handle_event(Event::ActiveWindowV2 {
+            addr: WindowAddr(1),
+        });
+
+        state.resync(
+            Some((WindowAddr(1), "firefox".to_string())),
+            1,
+            &[WindowAddr(1)],
+        );
+
+        assert_eq!(
+            state.handle_event(Event::ActiveLayout {
+                keyboard: "kbd",
+                layout_name: "English"
+            }),
+            vec![Action::QueryKeyboardLayout {
+                keyboard: "kbd".to_string()
             }]
         );
     }
