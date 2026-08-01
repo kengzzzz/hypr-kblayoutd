@@ -51,6 +51,40 @@ hyprctl clients
 
 ## Installation
 
+### Nix
+
+Run the daemon directly:
+
+```sh
+nix run github:kengzzzz/hypr-kblayoutd
+```
+
+The flake also exports `packages`, `apps`, an overlay, and a Home Manager
+module. In a NixOS configuration using Home Manager, pass the flake input to
+the module and add:
+
+```nix
+{
+  home-manager.sharedModules = [ hypr-kblayoutd.homeManagerModules.default ];
+
+  home-manager.users.your-user = {
+    services.hypr-kblayoutd = {
+      enable = true;
+      settings = {
+        keyboards.exclude_contains = [
+          "wlr_virtual_keyboard_v"
+          "yubikey"
+        ];
+        default_layouts.firefox = 0;
+      };
+    };
+  };
+}
+```
+
+The module writes `config.toml` and manages the daemon as a systemd user
+service attached to `graphical-session.target`.
+
 ### AUR
 
 ```sh
