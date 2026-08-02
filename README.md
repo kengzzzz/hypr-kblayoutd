@@ -82,8 +82,9 @@ the module and add:
 }
 ```
 
-The module writes `config.toml` and manages the daemon as a systemd user
-service attached to `graphical-session.target`.
+When `settings` is non-empty, the module writes `config.toml`; otherwise it
+leaves that path unmanaged. It manages the daemon as a systemd user service
+attached to `graphical-session.target`.
 
 ### AUR
 

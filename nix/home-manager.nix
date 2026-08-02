@@ -30,20 +30,22 @@ in
         default_layouts.firefox = 0;
       };
       description = ''
-        Configuration written to
-        {file}`$XDG_CONFIG_HOME/hypr-kblayoutd/config.toml`.
+        Settings written to
+        {file}`$XDG_CONFIG_HOME/hypr-kblayoutd/config.toml`. When empty,
+        Home Manager leaves that path unmanaged.
       '';
     };
   };
 
   config = lib.mkIf cfg.enable {
-    xdg.configFile."hypr-kblayoutd/config.toml".source = configFile;
+    xdg.configFile = lib.mkIf (cfg.settings != { }) {
+      "hypr-kblayoutd/config.toml".source = configFile;
+    };
 
     systemd.user.services.hypr-kblayoutd = {
       Unit = {
         Description = "Per-window keyboard layout daemon for Hyprland";
         Documentation = "https://github.com/kengzzzz/hypr-kblayoutd";
-        ConditionEnvironment = "WAYLAND_DISPLAY";
         After = [ "graphical-session.target" ];
         PartOf = [ "graphical-session.target" ];
         X-Restart-Triggers = [
