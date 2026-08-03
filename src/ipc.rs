@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::io::{Read, Write};
@@ -101,6 +102,18 @@ struct ActiveWindowResponse {
 #[derive(Debug, Deserialize)]
 struct ClientResponse {
     address: String,
+}
+
+type LayersResponse = BTreeMap<String, MonitorLayersResponse>;
+
+#[derive(Debug, Deserialize)]
+struct MonitorLayersResponse {
+    levels: BTreeMap<String, Vec<LayerResponse>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LayerResponse {
+    namespace: String,
 }
 
 impl HyprlandPaths {
@@ -210,7 +223,12 @@ impl HyprlandIpc {
             .collect()
     }
 
-    pub fn current_active_layout(&self) -> Result<LayoutIndex, IpcError> {
+    pub fn mapped_layer_namespaces(&self) -> Result<Vec<String>, IpcError> {
+        let response: LayersResponse = self.json_command("j/layers")?;
+        Ok(flatten_layer_namespaces(response))
+    }
+
+    pub fn current_active_keyboard(&self) -> Result<(String, LayoutIndex), IpcError> {
         let devices: DevicesResponse = self.json_command("j/devices")?;
         let keyboard = devices
             .keyboards
@@ -218,10 +236,23 @@ impl HyprlandIpc {
             .find(|keyboard| keyboard.main)
             .or_else(|| devices.keyboards.first())
             .ok_or_else(|| IpcError::MissingKeyboard("<any>".to_string()))?;
-
-        parse_layout_index(keyboard.active_layout_index)
-            .ok_or(IpcError::InvalidLayoutIndex(keyboard.active_layout_index))
+        let layout = parse_layout_index(keyboard.active_layout_index)
+            .ok_or(IpcError::InvalidLayoutIndex(keyboard.active_layout_index))?;
+        Ok((keyboard.name.clone(), layout))
     }
+
+    pub fn current_active_layout(&self) -> Result<LayoutIndex, IpcError> {
+        Ok(self.current_active_keyboard()?.1)
+    }
+}
+
+fn flatten_layer_namespaces(response: LayersResponse) -> Vec<String> {
+    response
+        .into_values()
+        .flat_map(|monitor| monitor.levels.into_values())
+        .flatten()
+        .map(|layer| layer.namespace)
+        .collect()
 }
 
 pub fn switch_layout_command(keyboard: &str, layout: LayoutIndex) -> String {
@@ -237,6 +268,31 @@ mod tests {
         assert_eq!(
             switch_layout_command("keychron-keychron-k2", 1),
             "switchxkblayout keychron-keychron-k2 1"
+        );
+    }
+
+    #[test]
+    fn layer_snapshot_preserves_duplicate_namespaces() {
+        let response: LayersResponse = serde_json::from_str(
+            r#"
+            {
+                "DP-3": {
+                    "levels": {
+                        "0": [{ "namespace": "wallpaper" }],
+                        "3": [
+                            { "namespace": "rofi" },
+                            { "namespace": "rofi" }
+                        ]
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            flatten_layer_namespaces(response),
+            ["wallpaper", "rofi", "rofi"]
         );
     }
 }

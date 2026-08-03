@@ -8,7 +8,8 @@ Small Hyprland daemon that remembers keyboard layout per window and restores the
 - Remembers the active layout for each window address.
 - Restores a remembered layout when that window becomes active again.
 - Gives new windows layout `0`, unless a class default is configured.
-- Learns keyboards from `activelayout` events unless keyboards are explicitly configured.
+- Optionally remembers a layout for layer-shell launchers (rofi, wofi, …), separately from the window underneath.
+- Seeds the active keyboard at startup and learns additional keyboards from `activelayout` events unless keyboards are explicitly configured.
 - Switches layouts through Hyprland's command socket directly, avoiding a `hyprctl` process per keyboard.
 - Reconnects to the Hyprland event socket with backoff if the socket disconnects.
 
@@ -38,6 +39,11 @@ exclude_contains = ["wlr_virtual_keyboard_v", "yubikey"]
 # Keys are also regexes (matched against the whole class), like Hyprland
 # window rules. Exact entries win over patterns. Handy for Chrome PWAs:
 "chrome-.*whatsapp.*" = 1
+
+# Layer-shell surfaces that take the keyboard while they are open, keyed by
+# namespace. Empty by default; listing one opts it into layout tracking.
+[layer_layouts]
+"rofi" = 0
 ```
 
 Layout indexes follow Hyprland's `input:kb_layout` order. For example, `kb_layout = us,th` means `us` is `0` and `th` is `1`.
@@ -47,7 +53,31 @@ Useful discovery commands:
 ```sh
 hyprctl devices -j
 hyprctl clients
+hyprctl layers   # namespaces for [layer_layouts]
 ```
+
+### Launchers and other layer surfaces
+
+Wayland launchers are not windows: they are layer-shell surfaces that take
+keyboard focus without changing Hyprland's active window. Without
+`[layer_layouts]` they inherit whatever the window underneath is using, and a
+layout switched while the launcher is open is wrongly remembered for that
+window.
+
+Add a namespace to `[layer_layouts]` to give it its own layout:
+
+- Opening it applies its remembered layout, or the configured value the first
+  time round.
+- A layout change while it is open belongs to the launcher, not the window.
+- Closing it restores the window underneath (or an outer layer, if stacked).
+- Keys are regexes here too, matched against the whole namespace.
+
+Only namespaces you list are tracked, because Hyprland's `openlayer` event
+fires for every layer surface — including bars and wallpapers, which never take
+the keyboard. These IPC events report mapping and unmapping, not keyboard focus,
+so only opt in a surface whose mapped lifetime matches the time it owns keyboard
+focus. Persistent layers or surfaces that change keyboard interactivity while
+remaining mapped cannot be tracked reliably through Hyprland's IPC events.
 
 ## Installation
 
