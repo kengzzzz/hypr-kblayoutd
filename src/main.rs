@@ -168,11 +168,22 @@ where
     }
 
     if !settled {
-        log::warn!(
-            "layer snapshot did not reach event delta: namespace={namespace} opening={opening}"
-        );
+        if opening && current > 0 {
+            log::warn!(
+                "layer snapshot did not reach repeated open event delta; keeping current count: namespace={namespace}"
+            );
+        } else {
+            log::warn!(
+                "layer snapshot did not reach event delta; applying logical event: namespace={namespace} opening={opening}"
+            );
+        }
     }
-    state.sync_layers(&latest)
+    let target_count = if !settled && opening && current > 0 {
+        current
+    } else {
+        expected
+    };
+    state.reconcile_layer_event(namespace, target_count, &latest)
 }
 
 fn run_actions(ipc: &HyprlandIpc, state: &mut RuntimeState, actions: Vec<Action>) {
@@ -216,13 +227,20 @@ mod tests {
     use hypr_kblayoutd::state::WindowAddr;
 
     fn test_state() -> RuntimeState {
+        test_state_with_layers(&[("rofi", 0)])
+    }
+
+    fn test_state_with_layers(layers: &[(&str, u8)]) -> RuntimeState {
         let config = Config {
             keyboards: KeyboardConfig {
                 include: vec!["kbd".to_string()],
                 exclude_contains: Vec::new(),
             },
             default_layouts: HashMap::new(),
-            layer_layouts: HashMap::from([("rofi".to_string(), 0)]),
+            layer_layouts: layers
+                .iter()
+                .map(|(namespace, layout)| ((*namespace).to_string(), *layout))
+                .collect(),
         };
         let mut state = RuntimeState::new(config, 0);
         state.handle_event(event::Event::ActiveWindowV2 {
@@ -266,9 +284,9 @@ mod tests {
     }
 
     #[test]
-    fn unsettled_buffered_close_does_not_remove_a_live_duplicate() {
+    fn settled_close_keeps_a_live_duplicate() {
         let mut state = test_state();
-        state.sync_layers(&snapshot(&["rofi"]));
+        state.sync_layers(&snapshot(&["rofi", "rofi"]));
         let mut queries = 0;
         let mut waits = 0;
 
@@ -282,9 +300,104 @@ mod tests {
             || waits += 1,
         );
 
+        assert_eq!(queries, 1);
+        assert_eq!(waits, 0);
+        assert!(actions.is_empty());
+        assert_eq!(state.focused_layer_count("rofi"), 1);
+    }
+
+    #[test]
+    fn animated_close_falls_back_to_event_when_snapshot_stays_stale() {
+        let mut state = test_state();
+        state.sync_layers(&snapshot(&["rofi"]));
+        let mut queries = 0;
+        let mut waits = 0;
+
+        // An unchanged snapshot is ambiguous: it can be a buffered close or
+        // an animating close. After retries, the close event wins.
+        let actions = handle_event_with_layer_snapshot(
+            &mut state,
+            event::Event::CloseLayer { namespace: "rofi" },
+            || {
+                queries += 1;
+                Ok::<_, &'static str>(snapshot(&["rofi"]))
+            },
+            || waits += 1,
+        );
+
         assert_eq!(queries, LAYER_SNAPSHOT_RETRIES + 1);
         assert_eq!(waits, LAYER_SNAPSHOT_RETRIES);
-        assert!(actions.is_empty());
+        assert_eq!(actions, switch(1, 0));
+        assert_eq!(state.focused_layer_count("rofi"), 0);
+    }
+
+    #[test]
+    fn quick_open_does_not_reimport_a_different_fading_layer() {
+        let mut state = test_state_with_layers(&[("rofi", 0), ("menu", 2)]);
+        state.sync_layers(&snapshot(&["rofi"]));
+
+        assert_eq!(
+            handle_event_with_layer_snapshot(
+                &mut state,
+                event::Event::CloseLayer { namespace: "rofi" },
+                || Ok::<_, &'static str>(snapshot(&["rofi"])),
+                || {},
+            ),
+            switch(1, 0)
+        );
+
+        assert_eq!(
+            handle_event_with_layer_snapshot(
+                &mut state,
+                event::Event::OpenLayer { namespace: "menu" },
+                || Ok::<_, &'static str>(snapshot(&["rofi", "menu"])),
+                || {},
+            ),
+            switch(2, 1)
+        );
+        assert_eq!(state.focused_layer_count("rofi"), 0);
+        assert_eq!(state.focused_layer_count("menu"), 1);
+    }
+
+    #[test]
+    fn quick_reopen_does_not_count_fading_same_namespace() {
+        let mut state = test_state();
+        state.sync_layers(&snapshot(&["rofi"]));
+
+        assert_eq!(
+            handle_event_with_layer_snapshot(
+                &mut state,
+                event::Event::CloseLayer { namespace: "rofi" },
+                || Ok::<_, &'static str>(snapshot(&["rofi"])),
+                || {},
+            ),
+            switch(1, 0)
+        );
+
+        assert_eq!(
+            handle_event_with_layer_snapshot(
+                &mut state,
+                event::Event::OpenLayer { namespace: "rofi" },
+                || Ok::<_, &'static str>(snapshot(&["rofi", "rofi"])),
+                || {},
+            ),
+            switch(0, 1)
+        );
+        assert_eq!(state.focused_layer_count("rofi"), 1);
+    }
+
+    #[test]
+    fn first_open_falls_back_to_event_when_snapshot_stays_stale() {
+        let mut state = test_state();
+
+        let actions = handle_event_with_layer_snapshot(
+            &mut state,
+            event::Event::OpenLayer { namespace: "rofi" },
+            || Ok::<_, &'static str>(snapshot(&[])),
+            || {},
+        );
+
+        assert_eq!(actions, switch(0, 1));
         assert_eq!(state.focused_layer_count("rofi"), 1);
     }
 

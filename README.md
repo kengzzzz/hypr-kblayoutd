@@ -79,6 +79,13 @@ so only opt in a surface whose mapped lifetime matches the time it owns keyboard
 focus. Persistent layers or surfaces that change keyboard interactivity while
 remaining mapped cannot be tracked reliably through Hyprland's IPC events.
 
+`j/layers` also includes surfaces that are only rendering an exit animation.
+Steady-state events are reconciled without importing those unrelated fading
+surfaces. At startup or reconnect, however, Hyprland exposes no focus flag or
+event sequence that can distinguish an already-open layer from one fading out.
+Starting the daemon during that narrow window can retain the layer until a
+later layer snapshot prunes it or the daemon reconnects after the animation.
+
 ## Installation
 
 ### Nix

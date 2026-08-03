@@ -267,6 +267,54 @@ impl RuntimeState {
         self.switch_actions(target)
     }
 
+    /// Reconcile a layer event without importing unrelated entries from
+    /// `j/layers`, which can include surfaces running their exit animation.
+    pub fn reconcile_layer_event(
+        &mut self,
+        namespace: &str,
+        target_count: usize,
+        live_layers: &[String],
+    ) -> Vec<Action> {
+        let mut remaining = HashMap::<&str, usize>::new();
+        for live in live_layers {
+            *remaining.entry(live.as_str()).or_default() += 1;
+        }
+
+        // Prune known layers from the snapshot without importing unknown ones.
+        let mut logical = Vec::with_capacity(self.focused_layers.len() + 1);
+        for focused in &self.focused_layers {
+            let Some(count) = remaining.get_mut(focused.as_str()) else {
+                continue;
+            };
+            if *count > 0 {
+                logical.push(focused.clone());
+                *count -= 1;
+            }
+        }
+
+        if self.layer_default(namespace).is_some() {
+            let current = logical
+                .iter()
+                .filter(|focused| focused.as_str() == namespace)
+                .count();
+            if target_count < current {
+                for _ in target_count..current {
+                    let position = logical
+                        .iter()
+                        .rposition(|focused| focused == namespace)
+                        .expect("logical layer count matched");
+                    logical.remove(position);
+                }
+            } else {
+                for _ in current..target_count {
+                    logical.push(namespace.to_string());
+                }
+            }
+        }
+
+        self.sync_layers(&logical)
+    }
+
     fn layer_default(&self, namespace: &str) -> Option<LayoutIndex> {
         if let Some(layout) = self.layer_defaults.get(namespace) {
             return Some(*layout);
