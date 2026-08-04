@@ -169,12 +169,10 @@ where
 
     if !settled {
         if opening && current > 0 {
-            log::warn!(
-                "layer snapshot did not reach repeated open event delta; keeping current count: namespace={namespace}"
-            );
+            log::debug!("layer surface still fading; keeping current count: namespace={namespace}");
         } else {
-            log::warn!(
-                "layer snapshot did not reach event delta; applying logical event: namespace={namespace} opening={opening}"
+            log::debug!(
+                "layer surface still fading; using logical count: namespace={namespace} opening={opening}"
             );
         }
     }
