@@ -16,6 +16,12 @@ pub enum Event<'a> {
         keyboard: &'a str,
         layout_name: &'a str,
     },
+    OpenLayer {
+        namespace: &'a str,
+    },
+    CloseLayer {
+        namespace: &'a str,
+    },
     Ignored,
 }
 
@@ -60,6 +66,8 @@ pub fn parse_line(line: &str) -> Result<Event<'_>, ParseError> {
                 layout_name,
             })
         }
+        "openlayer" => Ok(Event::OpenLayer { namespace: data }),
+        "closelayer" => Ok(Event::CloseLayer { namespace: data }),
         _ => Ok(Event::Ignored),
     }
 }
@@ -125,6 +133,18 @@ mod tests {
                 keyboard: "kbd",
                 layout_name: "English (US, intl., with dead keys)"
             }
+        );
+    }
+
+    #[test]
+    fn parses_layer_events() {
+        assert_eq!(
+            parse_line("openlayer>>rofi\n").unwrap(),
+            Event::OpenLayer { namespace: "rofi" }
+        );
+        assert_eq!(
+            parse_line("closelayer>>rofi\n").unwrap(),
+            Event::CloseLayer { namespace: "rofi" }
         );
     }
 

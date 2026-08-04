@@ -13,6 +13,7 @@ const DEFAULT_EXCLUDES: &[&str] = &["wlr_virtual_keyboard_v", "yubikey"];
 pub struct Config {
     pub keyboards: KeyboardConfig,
     pub default_layouts: HashMap<String, LayoutIndex>,
+    pub layer_layouts: HashMap<String, LayoutIndex>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,7 +26,7 @@ pub struct KeyboardConfig {
 pub enum ConfigError {
     Io(std::io::Error),
     Parse(toml::de::Error),
-    InvalidLayoutIndex { class_name: String, value: u16 },
+    InvalidLayoutIndex { key: String, value: u16 },
 }
 
 impl fmt::Display for ConfigError {
@@ -33,11 +34,8 @@ impl fmt::Display for ConfigError {
         match self {
             Self::Io(err) => write!(f, "failed to read config: {err}"),
             Self::Parse(err) => write!(f, "failed to parse config: {err}"),
-            Self::InvalidLayoutIndex { class_name, value } => {
-                write!(
-                    f,
-                    "layout index {value} for class {class_name:?} is too large"
-                )
+            Self::InvalidLayoutIndex { key, value } => {
+                write!(f, "layout index {value} for {key:?} is too large")
             }
         }
     }
@@ -58,6 +56,7 @@ impl Default for KeyboardConfig {
 struct RawConfig {
     keyboards: Option<RawKeyboardConfig>,
     default_layouts: Option<HashMap<String, u16>>,
+    layer_layouts: Option<HashMap<String, u16>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -92,15 +91,8 @@ pub fn load_optional(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
 pub fn parse(input: &str) -> Result<Config, ConfigError> {
     let raw: RawConfig = toml::from_str(input).map_err(ConfigError::Parse)?;
     let raw_keyboards = raw.keyboards.unwrap_or_default();
-    let mut default_layouts = HashMap::new();
-
-    for (class_name, value) in raw.default_layouts.unwrap_or_default() {
-        let index = LayoutIndex::try_from(value).map_err(|_| ConfigError::InvalidLayoutIndex {
-            class_name: class_name.clone(),
-            value,
-        })?;
-        default_layouts.insert(class_name, index);
-    }
+    let default_layouts = layout_map(raw.default_layouts.unwrap_or_default())?;
+    let layer_layouts = layout_map(raw.layer_layouts.unwrap_or_default())?;
 
     Ok(Config {
         keyboards: KeyboardConfig {
@@ -110,7 +102,21 @@ pub fn parse(input: &str) -> Result<Config, ConfigError> {
                 .unwrap_or_else(|| DEFAULT_EXCLUDES.iter().map(|s| (*s).to_string()).collect()),
         },
         default_layouts,
+        layer_layouts,
     })
+}
+
+fn layout_map(raw: HashMap<String, u16>) -> Result<HashMap<String, LayoutIndex>, ConfigError> {
+    raw.into_iter()
+        .map(|(key, value)| {
+            let index =
+                LayoutIndex::try_from(value).map_err(|_| ConfigError::InvalidLayoutIndex {
+                    key: key.clone(),
+                    value,
+                })?;
+            Ok((key, index))
+        })
+        .collect()
 }
 
 impl KeyboardConfig {
@@ -149,6 +155,9 @@ mod tests {
                 [default_layouts]
                 "org.telegram.desktop" = 1
                 "firefox" = 0
+
+                [layer_layouts]
+                "rofi" = 0
             "#,
         )
         .unwrap();
@@ -157,6 +166,20 @@ mod tests {
         assert!(cfg.keyboards.is_excluded("my-virtual-keyboard"));
         assert_eq!(cfg.default_layouts["org.telegram.desktop"], 1);
         assert_eq!(cfg.default_layouts["firefox"], 0);
+        assert_eq!(cfg.layer_layouts["rofi"], 0);
+    }
+
+    #[test]
+    fn layer_layouts_are_empty_by_default() {
+        let cfg = parse(
+            r#"
+                [default_layouts]
+                "discord" = 1
+            "#,
+        )
+        .unwrap();
+
+        assert!(cfg.layer_layouts.is_empty());
     }
 
     #[test]
