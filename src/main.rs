@@ -10,6 +10,8 @@ use hypr_kblayoutd::single_instance::SingleInstance;
 use hypr_kblayoutd::state::{Action, RuntimeState};
 
 const LAYER_SNAPSHOT_RETRIES: usize = 9;
+const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_millis(100);
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
@@ -33,7 +35,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let (initial_keyboard, initial_layout) = ipc.current_active_keyboard()?;
     let mut state = RuntimeState::new(config, initial_layout);
-    state.seed_keyboard(&initial_keyboard);
+    state.seed_keyboard(&initial_keyboard, initial_layout);
     listen_forever(&ipc, &mut state)
 }
 
@@ -41,37 +43,52 @@ fn listen_forever(
     ipc: &HyprlandIpc,
     state: &mut RuntimeState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut backoff = Duration::from_millis(100);
+    let mut backoff = INITIAL_RECONNECT_BACKOFF;
 
     loop {
-        let result = UnixStream::connect(&ipc.paths().event_socket).and_then(|stream| {
-            // Connect first so events emitted during the snapshot are buffered.
-            resync_state(ipc, state);
-            listen_once(stream, ipc, state)
-        });
+        let (connected, result) = match UnixStream::connect(&ipc.paths().event_socket) {
+            Ok(stream) => {
+                // Connect first so events emitted during the snapshot are buffered.
+                resync_state(ipc, state);
+                (true, listen_once(stream, ipc, state))
+            }
+            Err(err) => (false, Err(err)),
+        };
         match result {
             Ok(()) => log::warn!("Hyprland event socket closed; reconnecting"),
             Err(err) => log::warn!("Hyprland event socket error: {err}; reconnecting"),
         }
 
-        thread::sleep(backoff);
-        backoff = (backoff * 2).min(Duration::from_secs(5));
+        thread::sleep(reconnect_delay(&mut backoff, connected));
     }
+}
+
+fn reconnect_delay(backoff: &mut Duration, connected: bool) -> Duration {
+    if connected {
+        *backoff = INITIAL_RECONNECT_BACKOFF;
+    }
+    let delay = *backoff;
+    if !connected {
+        *backoff = (*backoff * 2).min(MAX_RECONNECT_BACKOFF);
+    }
+    delay
 }
 
 // Events can be missed at startup and while the event socket is down, so
 // re-align window/layout state with Hyprland before (re)attaching.
 fn resync_state(ipc: &HyprlandIpc, state: &mut RuntimeState) {
-    let queried = ipc.current_active_layout().and_then(|layout| {
-        let active = ipc.active_window()?;
-        let clients = ipc.client_addresses()?;
-        let layers = ipc.mapped_layer_namespaces()?;
-        Ok((layout, active, clients, layers))
-    });
+    let queried = ipc
+        .current_active_keyboard()
+        .and_then(|(keyboard, layout)| {
+            let active = ipc.active_window()?;
+            let clients = ipc.client_addresses()?;
+            let layers = ipc.mapped_layer_namespaces()?;
+            Ok((keyboard, layout, active, clients, layers))
+        });
 
     match queried {
-        Ok((layout, active, clients, layers)) => {
-            let actions = state.resync(active, layout, &clients, &layers);
+        Ok((keyboard, layout, active, clients, layers)) => {
+            let actions = state.resync(active, &keyboard, layout, &clients, &layers);
             run_actions(ipc, state, actions);
         }
         Err(err) => log::warn!("state resync skipped: {err}"),
@@ -198,7 +215,11 @@ fn run_actions(ipc: &HyprlandIpc, state: &mut RuntimeState, actions: Vec<Action>
                         Ok(()) => any_switched = true,
                         Err(err) => {
                             log::warn!("failed to switch {keyboard} to layout {layout}: {err}");
-                            state.switch_failed(&keyboard);
+                            if err.is_missing_keyboard() {
+                                state.keyboard_disappeared(&keyboard);
+                            } else {
+                                state.switch_failed(&keyboard);
+                            }
                         }
                     }
                 }
@@ -209,7 +230,12 @@ fn run_actions(ipc: &HyprlandIpc, state: &mut RuntimeState, actions: Vec<Action>
             Action::QueryKeyboardLayout { keyboard } => {
                 match ipc.active_layout_for_keyboard(&keyboard) {
                     Ok(layout) => state.record_keyboard_layout(&keyboard, layout),
-                    Err(err) => log::warn!("failed to query active layout for {keyboard}: {err}"),
+                    Err(err) => {
+                        log::warn!("failed to query active layout for {keyboard}: {err}");
+                        if err.is_missing_keyboard() {
+                            state.keyboard_disappeared(&keyboard);
+                        }
+                    }
                 }
             }
         }
@@ -241,6 +267,7 @@ mod tests {
                 .collect(),
         };
         let mut state = RuntimeState::new(config, 0);
+        state.seed_keyboard("kbd", 0);
         state.handle_event(event::Event::ActiveWindowV2 {
             addr: WindowAddr(1),
         });
@@ -254,6 +281,32 @@ mod tests {
             layout,
             previous,
         }]
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_after_successful_connection() {
+        let mut backoff = MAX_RECONNECT_BACKOFF;
+
+        assert_eq!(
+            reconnect_delay(&mut backoff, true),
+            INITIAL_RECONNECT_BACKOFF
+        );
+        assert_eq!(backoff, INITIAL_RECONNECT_BACKOFF);
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_after_failed_connections() {
+        let mut backoff = INITIAL_RECONNECT_BACKOFF;
+
+        assert_eq!(
+            reconnect_delay(&mut backoff, false),
+            INITIAL_RECONNECT_BACKOFF
+        );
+        assert_eq!(backoff, INITIAL_RECONNECT_BACKOFF * 2);
+
+        backoff = MAX_RECONNECT_BACKOFF;
+        assert_eq!(reconnect_delay(&mut backoff, false), MAX_RECONNECT_BACKOFF);
+        assert_eq!(backoff, MAX_RECONNECT_BACKOFF);
     }
 
     fn snapshot(namespaces: &[&str]) -> Vec<String> {

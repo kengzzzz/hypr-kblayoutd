@@ -47,6 +47,13 @@ impl fmt::Display for IpcError {
 
 impl std::error::Error for IpcError {}
 
+impl IpcError {
+    pub fn is_missing_keyboard(&self) -> bool {
+        matches!(self, Self::MissingKeyboard(_))
+            || matches!(self, Self::CommandFailed(response) if response == "device not found")
+    }
+}
+
 impl From<std::io::Error> for IpcError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
@@ -269,6 +276,13 @@ mod tests {
             switch_layout_command("keychron-keychron-k2", 1),
             "switchxkblayout keychron-keychron-k2 1"
         );
+    }
+
+    #[test]
+    fn identifies_missing_keyboard_errors() {
+        assert!(IpcError::MissingKeyboard("kbd".to_string()).is_missing_keyboard());
+        assert!(IpcError::CommandFailed("device not found".to_string()).is_missing_keyboard());
+        assert!(!IpcError::CommandFailed("invalid layout".to_string()).is_missing_keyboard());
     }
 
     #[test]
