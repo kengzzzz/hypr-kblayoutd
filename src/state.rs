@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use regex_lite::Regex;
@@ -23,6 +23,13 @@ pub enum Action {
     },
 }
 
+#[derive(Debug, Copy, Clone)]
+struct PendingSwitch {
+    target: LayoutIndex,
+    previous: Option<LayoutIndex>,
+    echo_expected: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeState {
     windows: HashMap<WindowAddr, LayoutIndex>,
@@ -30,6 +37,7 @@ pub struct RuntimeState {
     active_class: Option<String>,
     active_layout: LayoutIndex,
     keyboards: Vec<String>,
+    keyboard_layouts: HashMap<String, LayoutIndex>,
     configured_keyboards: bool,
     exclude_contains: Vec<String>,
     defaults_by_class: HashMap<String, LayoutIndex>,
@@ -41,7 +49,7 @@ pub struct RuntimeState {
     focused_layers: Vec<String>,
     layer_defaults: HashMap<String, LayoutIndex>,
     layer_patterns: Vec<(Regex, LayoutIndex)>,
-    pending_echoes: HashMap<String, u8>,
+    pending_switches: HashMap<String, VecDeque<PendingSwitch>>,
 }
 
 impl RuntimeState {
@@ -55,6 +63,7 @@ impl RuntimeState {
             active_class: None,
             active_layout,
             keyboards: config.keyboards.include,
+            keyboard_layouts: HashMap::new(),
             configured_keyboards,
             exclude_contains: config.keyboards.exclude_contains,
             defaults_by_class: config.default_layouts,
@@ -63,7 +72,7 @@ impl RuntimeState {
             focused_layers: Vec::new(),
             layer_defaults: config.layer_layouts,
             layer_patterns,
-            pending_echoes: HashMap::new(),
+            pending_switches: HashMap::new(),
         }
     }
 
@@ -93,6 +102,11 @@ impl RuntimeState {
     pub fn record_keyboard_layout(&mut self, keyboard: &str, layout: LayoutIndex) {
         if !self.is_managed_keyboard(keyboard) {
             log::debug!("keyboard skipped while recording layout: keyboard={keyboard}");
+            return;
+        }
+        self.keyboard_layouts.insert(keyboard.to_string(), layout);
+        if self.consume_pending_echo(keyboard, layout) {
+            log::debug!("own layout switch echoed back, ignored: keyboard={keyboard}");
             return;
         }
         self.active_layout = layout;
@@ -141,15 +155,18 @@ impl RuntimeState {
         !self.focused_layers.is_empty() || self.layer_default(namespace).is_some()
     }
 
-    pub fn seed_keyboard(&mut self, keyboard: &str) {
-        if self.configured_keyboards
-            || self.is_excluded_keyboard(keyboard)
-            || self.keyboards.iter().any(|known| known == keyboard)
-        {
+    pub fn seed_keyboard(&mut self, keyboard: &str, layout: LayoutIndex) {
+        if !self.configured_keyboards {
+            if self.is_excluded_keyboard(keyboard) {
+                return;
+            }
+            self.learn_keyboard(keyboard);
+        }
+        if !self.keyboards.iter().any(|known| known == keyboard) {
             return;
         }
-        self.keyboards.push(keyboard.to_string());
-        log::debug!("keyboard seeded: keyboard={keyboard}");
+        self.keyboard_layouts.insert(keyboard.to_string(), layout);
+        log::debug!("keyboard seeded: keyboard={keyboard} layout={layout}");
     }
 
     /// Re-align state with Hyprland after events may have been missed
@@ -157,12 +174,18 @@ impl RuntimeState {
     pub fn resync(
         &mut self,
         active: Option<(WindowAddr, String)>,
+        actual_keyboard: &str,
         actual_layout: LayoutIndex,
         live_windows: &[WindowAddr],
         live_layers: &[String],
     ) -> Vec<Action> {
         self.windows.retain(|addr, _| live_windows.contains(addr));
-        self.pending_echoes.clear();
+        self.pending_switches.clear();
+        self.keyboard_layouts.clear();
+        if self.is_managed_keyboard(actual_keyboard) {
+            self.keyboard_layouts
+                .insert(actual_keyboard.to_string(), actual_layout);
+        }
         self.active_layout = actual_layout;
         let layer_target = self.reconcile_layers(live_layers, Some(actual_layout));
 
@@ -326,21 +349,17 @@ impl RuntimeState {
     }
 
     fn handle_active_layout(&mut self, keyboard: &str) -> Vec<Action> {
-        if self.is_excluded_keyboard(keyboard) {
-            log::debug!("keyboard skipped due to exclude rule: keyboard={keyboard}");
-            return Vec::new();
-        }
-        if self.consume_pending_echo(keyboard) {
-            log::debug!("own layout switch echoed back, ignored: keyboard={keyboard}");
-            return Vec::new();
-        }
         if self.configured_keyboards {
             if !self.keyboards.iter().any(|known| known == keyboard) {
                 log::debug!("keyboard skipped due to include rule: keyboard={keyboard}");
                 return Vec::new();
             }
-        } else {
-            self.seed_keyboard(keyboard);
+        } else if self.is_excluded_keyboard(keyboard) {
+            log::debug!("keyboard skipped due to exclude rule: keyboard={keyboard}");
+            return Vec::new();
+        }
+        if !self.configured_keyboards {
+            self.learn_keyboard(keyboard);
         }
 
         vec![Action::QueryKeyboardLayout {
@@ -349,10 +368,6 @@ impl RuntimeState {
     }
 
     fn switch_actions(&mut self, target: LayoutIndex) -> Vec<Action> {
-        if target == self.active_layout {
-            log::debug!("layout switch skipped: target_layout={target} already active");
-            return Vec::new();
-        }
         if self.keyboards.is_empty() {
             log::debug!(
                 "layout switch skipped: target_layout={target} no managed keyboards are known"
@@ -360,31 +375,99 @@ impl RuntimeState {
             self.active_layout = target;
             return Vec::new();
         }
+        let keyboards: Vec<String> = self
+            .keyboards
+            .iter()
+            .filter(|keyboard| self.keyboard_layouts.get(*keyboard) != Some(&target))
+            .cloned()
+            .collect();
+        if keyboards.is_empty() {
+            log::debug!(
+                "layout switch skipped: target_layout={target} all managed keyboards already active"
+            );
+            self.active_layout = target;
+            return Vec::new();
+        }
         let previous = self.active_layout;
         self.active_layout = target;
-        for keyboard in &self.keyboards {
-            *self.pending_echoes.entry(keyboard.clone()).or_insert(0) += 1;
+        for keyboard in &keyboards {
+            let previous = self.keyboard_layouts.insert(keyboard.clone(), target);
+            let echo_expected = previous.is_some_and(|layout| layout != target);
+            self.pending_switches
+                .entry(keyboard.clone())
+                .or_default()
+                .push_back(PendingSwitch {
+                    target,
+                    previous,
+                    echo_expected,
+                });
         }
         vec![Action::SwitchLayout {
-            keyboards: self.keyboards.clone(),
+            keyboards,
             layout: target,
             previous,
         }]
     }
 
     pub fn switch_failed(&mut self, keyboard: &str) {
-        self.consume_pending_echo(keyboard);
+        let Some(pending) = self.pending_switches.get_mut(keyboard) else {
+            return;
+        };
+        let failed = pending.pop_back();
+        if pending.is_empty() {
+            self.pending_switches.remove(keyboard);
+        }
+        let Some(failed) = failed else {
+            return;
+        };
+        match failed.previous {
+            Some(layout) => {
+                self.keyboard_layouts.insert(keyboard.to_string(), layout);
+            }
+            None => {
+                self.keyboard_layouts.remove(keyboard);
+            }
+        }
     }
 
-    fn consume_pending_echo(&mut self, keyboard: &str) -> bool {
-        let Some(count) = self.pending_echoes.get_mut(keyboard) else {
+    pub fn keyboard_disappeared(&mut self, keyboard: &str) {
+        self.pending_switches.remove(keyboard);
+        self.keyboard_layouts.remove(keyboard);
+        if self.configured_keyboards {
+            return;
+        }
+        let previous_len = self.keyboards.len();
+        self.keyboards.retain(|known| known != keyboard);
+        if self.keyboards.len() != previous_len {
+            log::debug!("auto-learned keyboard forgotten: keyboard={keyboard}");
+        }
+    }
+
+    fn consume_pending_echo(&mut self, keyboard: &str, layout: LayoutIndex) -> bool {
+        let Some(pending) = self.pending_switches.get_mut(keyboard) else {
             return false;
         };
-        *count -= 1;
-        if *count == 0 {
-            self.pending_echoes.remove(keyboard);
+        let mut own_echo = false;
+        while let Some(expected) = pending.pop_front() {
+            if expected.echo_expected || expected.target == layout {
+                own_echo = true;
+                break;
+            }
+            // A switch from an unknown prior layout may not emit an event. If
+            // it does not match this event, discard it and inspect the next.
         }
-        true
+        if pending.is_empty() {
+            self.pending_switches.remove(keyboard);
+        }
+        own_echo
+    }
+
+    fn learn_keyboard(&mut self, keyboard: &str) {
+        if self.keyboards.iter().any(|known| known == keyboard) {
+            return;
+        }
+        self.keyboards.push(keyboard.to_string());
+        log::debug!("keyboard learned: keyboard={keyboard}");
     }
 
     fn default_layout_for_active_class(&self) -> LayoutIndex {
@@ -402,8 +485,11 @@ impl RuntimeState {
     }
 
     fn is_managed_keyboard(&self, keyboard: &str) -> bool {
-        !self.is_excluded_keyboard(keyboard)
-            && (!self.configured_keyboards || self.keyboards.iter().any(|known| known == keyboard))
+        if self.configured_keyboards {
+            self.keyboards.iter().any(|known| known == keyboard)
+        } else {
+            !self.is_excluded_keyboard(keyboard)
+        }
     }
 
     fn is_excluded_keyboard(&self, keyboard: &str) -> bool {
@@ -523,6 +609,18 @@ mod tests {
         }
     }
 
+    fn runtime(config: Config, active_layout: LayoutIndex) -> RuntimeState {
+        let initial_keyboard = config
+            .keyboards
+            .include
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "wlr_virtual_keyboard_v-test".to_string());
+        let mut state = RuntimeState::new(config, active_layout);
+        state.seed_keyboard(&initial_keyboard, active_layout);
+        state
+    }
+
     fn layer_config(layers: &[(&str, LayoutIndex)]) -> Config {
         Config {
             layer_layouts: layers
@@ -550,7 +648,7 @@ mod tests {
 
     #[test]
     fn new_window_uses_class_default() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[("firefox", 1)]), 0);
+        let mut state = runtime(config(&["kbd"], &[("firefox", 1)]), 0);
         state.handle_event(Event::ActiveWindow {
             class_name: "firefox",
         });
@@ -570,7 +668,7 @@ mod tests {
 
     #[test]
     fn new_window_matches_class_default_as_regex() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[("chrome-.*whatsapp.*", 1)]), 0);
+        let mut state = runtime(config(&["kbd"], &[("chrome-.*whatsapp.*", 1)]), 0);
         state.handle_event(Event::ActiveWindow {
             class_name: "chrome-web.whatsapp.com__-Default",
         });
@@ -589,7 +687,7 @@ mod tests {
 
     #[test]
     fn exact_class_default_wins_over_pattern() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[("fire.*", 1), ("firefox", 2)]), 0);
+        let mut state = runtime(config(&["kbd"], &[("fire.*", 1), ("firefox", 2)]), 0);
         state.handle_event(Event::ActiveWindow {
             class_name: "firefox",
         });
@@ -602,7 +700,7 @@ mod tests {
 
     #[test]
     fn pattern_matches_whole_class_only() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[("firefox", 1)]), 0);
+        let mut state = runtime(config(&["kbd"], &[("firefox", 1)]), 0);
         state.handle_event(Event::ActiveWindow {
             class_name: "firefox-nightly",
         });
@@ -615,7 +713,7 @@ mod tests {
 
     #[test]
     fn invalid_regex_key_still_matches_exactly() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[("app(broken", 1)]), 0);
+        let mut state = runtime(config(&["kbd"], &[("app(broken", 1)]), 0);
         state.handle_event(Event::ActiveWindow {
             class_name: "app(broken",
         });
@@ -628,7 +726,7 @@ mod tests {
 
     #[test]
     fn known_window_restores_saved_layout() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[]), 0);
+        let mut state = runtime(config(&["kbd"], &[]), 0);
         state.handle_event(Event::ActiveWindowV2 {
             addr: WindowAddr(1),
         });
@@ -651,7 +749,7 @@ mod tests {
 
     #[test]
     fn same_layout_does_not_emit_switch() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[("firefox", 0)]), 0);
+        let mut state = runtime(config(&["kbd"], &[("firefox", 0)]), 0);
         state.handle_event(Event::ActiveWindow {
             class_name: "firefox",
         });
@@ -664,8 +762,31 @@ mod tests {
     }
 
     #[test]
+    fn global_layout_match_does_not_skip_other_managed_keyboards() {
+        let mut state = runtime(config(&["kbd-a", "kbd-b"], &[("firefox", 1)]), 0);
+
+        // Only kbd-b changed. The global state now says 1, but kbd-a is
+        // still at 0 and needs the next restoration command.
+        state.record_keyboard_layout("kbd-b", 1);
+        state.handle_event(Event::ActiveWindow {
+            class_name: "firefox",
+        });
+
+        assert_eq!(
+            state.handle_event(Event::ActiveWindowV2 {
+                addr: WindowAddr(1)
+            }),
+            vec![Action::SwitchLayout {
+                keyboards: vec!["kbd-a".to_string()],
+                layout: 1,
+                previous: 1
+            }]
+        );
+    }
+
+    #[test]
     fn active_layout_learns_keyboard_when_unconfigured() {
-        let mut state = RuntimeState::new(config(&[], &[]), 0);
+        let mut state = runtime(config(&[], &[]), 0);
         assert_eq!(
             state.handle_event(Event::ActiveLayout {
                 keyboard: "kbd",
@@ -680,7 +801,7 @@ mod tests {
 
     #[test]
     fn configured_keyboard_ignores_other_keyboards() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[]), 0);
+        let mut state = runtime(config(&["kbd"], &[]), 0);
         assert!(state
             .handle_event(Event::ActiveLayout {
                 keyboard: "other",
@@ -690,8 +811,117 @@ mod tests {
     }
 
     #[test]
+    fn explicitly_included_keyboard_overrides_learned_exclusion() {
+        let mut state = runtime(config(&["virtual-kbd"], &[]), 0);
+
+        assert_eq!(
+            state.handle_event(Event::ActiveLayout {
+                keyboard: "virtual-kbd",
+                layout_name: "English"
+            }),
+            vec![Action::QueryKeyboardLayout {
+                keyboard: "virtual-kbd".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn silent_own_switch_does_not_hide_next_manual_change() {
+        let mut state = runtime(config(&["kbd-a", "kbd-b"], &[("firefox", 0)]), 1);
+        state.record_keyboard_layout("kbd-b", 0);
+        state.record_keyboard_layout("kbd-a", 1);
+        state.handle_event(Event::ActiveWindow {
+            class_name: "firefox",
+        });
+        assert_eq!(
+            state.handle_event(Event::ActiveWindowV2 {
+                addr: WindowAddr(1),
+            }),
+            vec![Action::SwitchLayout {
+                keyboards: vec!["kbd-a".to_string()],
+                layout: 0,
+                previous: 1,
+            }]
+        );
+
+        // kbd-a changed to 0 and emitted an echo. kbd-b was already at 0,
+        // so it was not sent a redundant command and has no pending echo.
+        assert_eq!(
+            state.handle_event(Event::ActiveLayout {
+                keyboard: "kbd-a",
+                layout_name: "English"
+            }),
+            vec![Action::QueryKeyboardLayout {
+                keyboard: "kbd-a".to_string()
+            }]
+        );
+        state.record_keyboard_layout("kbd-a", 0);
+
+        assert_eq!(
+            state.handle_event(Event::ActiveLayout {
+                keyboard: "kbd-b",
+                layout_name: "Thai"
+            }),
+            vec![Action::QueryKeyboardLayout {
+                keyboard: "kbd-b".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn silent_unknown_switch_does_not_leave_later_echo_pending() {
+        let mut state = runtime(
+            config(&["kbd-a", "kbd-b"], &[("firefox", 1), ("other", 0)]),
+            1,
+        );
+        state.handle_event(Event::ActiveWindow {
+            class_name: "firefox",
+        });
+
+        // kbd-b's actual layout is already 1, but it is not known yet. The
+        // command succeeds silently and leaves an uncertain pending switch.
+        assert_eq!(
+            state.handle_event(Event::ActiveWindowV2 {
+                addr: WindowAddr(1)
+            }),
+            vec![Action::SwitchLayout {
+                keyboards: vec!["kbd-b".to_string()],
+                layout: 1,
+                previous: 1
+            }]
+        );
+
+        state.handle_event(Event::ActiveWindow {
+            class_name: "other",
+        });
+        assert_eq!(
+            state.handle_event(Event::ActiveWindowV2 {
+                addr: WindowAddr(2)
+            }),
+            vec![Action::SwitchLayout {
+                keyboards: vec!["kbd-a".to_string(), "kbd-b".to_string()],
+                layout: 0,
+                previous: 1
+            }]
+        );
+
+        assert_eq!(
+            state.handle_event(Event::ActiveLayout {
+                keyboard: "kbd-b",
+                layout_name: "English"
+            }),
+            vec![Action::QueryKeyboardLayout {
+                keyboard: "kbd-b".to_string()
+            }]
+        );
+        state.record_keyboard_layout("kbd-b", 0);
+
+        assert!(!state.pending_switches.contains_key("kbd-b"));
+    }
+
+    #[test]
     fn excluded_keyboard_is_ignored() {
-        let mut state = RuntimeState::new(config(&[], &[]), 0);
+        let mut state = runtime(config(&[], &[]), 0);
         assert!(state
             .handle_event(Event::ActiveLayout {
                 keyboard: "virtual-keyboard",
@@ -703,7 +933,7 @@ mod tests {
 
     #[test]
     fn close_window_forgets_saved_layout() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[]), 0);
+        let mut state = runtime(config(&["kbd"], &[]), 0);
         state.handle_event(Event::ActiveWindowV2 {
             addr: WindowAddr(1),
         });
@@ -727,7 +957,7 @@ mod tests {
 
     #[test]
     fn empty_active_window_clears_active_window() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[]), 0);
+        let mut state = runtime(config(&["kbd"], &[]), 0);
         state.handle_event(Event::ActiveWindowV2 {
             addr: WindowAddr(1),
         });
@@ -754,7 +984,7 @@ mod tests {
 
     #[test]
     fn own_switch_echo_is_ignored_once() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[("firefox", 1)]), 0);
+        let mut state = runtime(config(&["kbd"], &[("firefox", 1)]), 0);
         state.handle_event(Event::ActiveWindow {
             class_name: "firefox",
         });
@@ -768,7 +998,15 @@ mod tests {
             keyboard: "kbd",
             layout_name: "Thai",
         };
-        assert!(state.handle_event(echo.clone()).is_empty());
+        assert_eq!(
+            state.handle_event(echo.clone()),
+            vec![Action::QueryKeyboardLayout {
+                keyboard: "kbd".to_string()
+            }]
+        );
+        state.record_keyboard_layout("kbd", 1);
+        assert!(!state.pending_switches.contains_key("kbd"));
+
         assert_eq!(
             state.handle_event(echo),
             vec![Action::QueryKeyboardLayout {
@@ -779,7 +1017,7 @@ mod tests {
 
     #[test]
     fn switch_failed_clears_pending_echo() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[("firefox", 1)]), 0);
+        let mut state = runtime(config(&["kbd"], &[("firefox", 1)]), 0);
         state.handle_event(Event::ActiveWindow {
             class_name: "firefox",
         });
@@ -800,8 +1038,67 @@ mod tests {
     }
 
     #[test]
+    fn disappeared_auto_learned_keyboard_is_not_switched_again() {
+        let mut cfg = config(&[], &[("firefox", 1)]);
+        cfg.keyboards = KeyboardConfig::default();
+        let mut state = runtime(cfg, 0);
+        state.seed_keyboard("main-kbd", 0);
+        state.handle_event(Event::ActiveLayout {
+            keyboard: "hl-virtual-keyboard-wtype",
+            layout_name: "English",
+        });
+        state.handle_event(Event::ActiveWindow {
+            class_name: "firefox",
+        });
+
+        assert_eq!(
+            state.handle_event(Event::ActiveWindowV2 {
+                addr: WindowAddr(1)
+            }),
+            vec![Action::SwitchLayout {
+                keyboards: vec![
+                    "main-kbd".to_string(),
+                    "hl-virtual-keyboard-wtype".to_string()
+                ],
+                layout: 1,
+                previous: 0
+            }]
+        );
+        state.switch_failed("main-kbd");
+        state.keyboard_disappeared("hl-virtual-keyboard-wtype");
+        state.set_active_layout(0);
+
+        assert_eq!(
+            state.handle_event(Event::ActiveWindowV2 {
+                addr: WindowAddr(1)
+            }),
+            vec![Action::SwitchLayout {
+                keyboards: vec!["main-kbd".to_string()],
+                layout: 1,
+                previous: 0
+            }]
+        );
+        assert_eq!(state.keyboard_names(), ["main-kbd"]);
+    }
+
+    #[test]
+    fn disappeared_configured_keyboard_remains_tracked() {
+        let mut state = runtime(config(&["kbd"], &[("firefox", 1)]), 0);
+        state.handle_event(Event::ActiveWindow {
+            class_name: "firefox",
+        });
+        state.handle_event(Event::ActiveWindowV2 {
+            addr: WindowAddr(1),
+        });
+
+        state.keyboard_disappeared("kbd");
+
+        assert_eq!(state.keyboard_names(), ["kbd"]);
+    }
+
+    #[test]
     fn untracked_layer_is_ignored() {
-        let mut state = RuntimeState::new(layer_config(&[("rofi", 0)]), 1);
+        let mut state = runtime(layer_config(&[("rofi", 0)]), 1);
         assert!(!state.should_reconcile_layer_event("waybar"));
         assert!(state.sync_layers(&layer_snapshot(&["waybar"])).is_empty());
         assert!(state.sync_layers(&[]).is_empty());
@@ -810,7 +1107,7 @@ mod tests {
 
     #[test]
     fn tracked_layer_applies_default_then_restores_window() {
-        let mut state = RuntimeState::new(layer_config(&[("rofi", 0)]), 0);
+        let mut state = runtime(layer_config(&[("rofi", 0)]), 0);
         state.handle_event(Event::ActiveWindowV2 {
             addr: WindowAddr(1),
         });
@@ -822,7 +1119,7 @@ mod tests {
 
     #[test]
     fn layer_remembers_its_own_layout_across_opens() {
-        let mut state = RuntimeState::new(layer_config(&[("rofi", 0)]), 0);
+        let mut state = runtime(layer_config(&[("rofi", 0)]), 0);
         state.handle_event(Event::ActiveWindowV2 {
             addr: WindowAddr(1),
         });
@@ -837,7 +1134,7 @@ mod tests {
 
     #[test]
     fn layer_namespace_matches_as_regex() {
-        let mut state = RuntimeState::new(layer_config(&[("rofi.*", 1)]), 0);
+        let mut state = runtime(layer_config(&[("rofi.*", 1)]), 0);
         assert_eq!(
             state.sync_layers(&layer_snapshot(&["rofi-launcher"])),
             switch(1, 0)
@@ -846,7 +1143,7 @@ mod tests {
 
     #[test]
     fn window_focus_under_a_layer_does_not_switch_until_it_closes() {
-        let mut state = RuntimeState::new(layer_config(&[("rofi", 0)]), 0);
+        let mut state = runtime(layer_config(&[("rofi", 0)]), 0);
         state.handle_event(Event::ActiveWindowV2 {
             addr: WindowAddr(1),
         });
@@ -866,7 +1163,7 @@ mod tests {
 
     #[test]
     fn stacked_layers_unwind_in_order() {
-        let mut state = RuntimeState::new(layer_config(&[("rofi", 0), ("menu", 2)]), 0);
+        let mut state = runtime(layer_config(&[("rofi", 0), ("menu", 2)]), 0);
         state.handle_event(Event::ActiveWindowV2 {
             addr: WindowAddr(1),
         });
@@ -883,7 +1180,7 @@ mod tests {
 
     #[test]
     fn same_namespace_layers_unwind_one_surface_at_a_time() {
-        let mut state = RuntimeState::new(layer_config(&[("rofi", 0)]), 0);
+        let mut state = runtime(layer_config(&[("rofi", 0)]), 0);
         state.handle_event(Event::ActiveWindowV2 {
             addr: WindowAddr(1),
         });
@@ -903,7 +1200,7 @@ mod tests {
 
     #[test]
     fn raw_layer_events_match_snapshot_transitions() {
-        let mut state = RuntimeState::new(layer_config(&[("rofi", 0)]), 0);
+        let mut state = runtime(layer_config(&[("rofi", 0)]), 0);
         state.handle_event(Event::ActiveWindowV2 {
             addr: WindowAddr(1),
         });
@@ -924,15 +1221,15 @@ mod tests {
     fn seeded_keyboard_switches_before_first_layout_event() {
         let mut cfg = layer_config(&[("rofi", 1)]);
         cfg.keyboards.include.clear();
-        let mut state = RuntimeState::new(cfg, 0);
-        state.seed_keyboard("kbd");
+        let mut state = runtime(cfg, 0);
+        state.seed_keyboard("kbd", 0);
 
         assert_eq!(state.sync_layers(&layer_snapshot(&["rofi"])), switch(1, 0));
     }
 
     #[test]
     fn unmatched_close_layer_is_ignored() {
-        let mut state = RuntimeState::new(layer_config(&[("rofi", 1)]), 0);
+        let mut state = runtime(layer_config(&[("rofi", 1)]), 0);
         state.handle_event(Event::ActiveWindowV2 {
             addr: WindowAddr(1),
         });
@@ -943,18 +1240,23 @@ mod tests {
 
     #[test]
     fn resync_drops_stranded_layer_focus() {
-        let mut state = RuntimeState::new(layer_config(&[("rofi", 1)]), 0);
+        let mut state = runtime(layer_config(&[("rofi", 1)]), 0);
         state.handle_event(Event::ActiveWindowV2 {
             addr: WindowAddr(1),
         });
         state.sync_layers(&layer_snapshot(&["rofi"]));
 
-        state.resync(
-            Some((WindowAddr(1), "firefox".to_string())),
-            1,
-            &[WindowAddr(1)],
-            &[],
+        assert_eq!(
+            state.resync(
+                Some((WindowAddr(1), "firefox".to_string())),
+                "kbd",
+                1,
+                &[WindowAddr(1)],
+                &[],
+            ),
+            switch(0, 1)
         );
+        state.record_keyboard_layout("kbd", 0);
 
         // Focus is on the window again, so layout changes land on the window.
         state.record_keyboard_layout("kbd", 1);
@@ -963,7 +1265,7 @@ mod tests {
 
     #[test]
     fn resync_keeps_layer_focus_while_it_remains_mapped() {
-        let mut state = RuntimeState::new(layer_config(&[("rofi", 0)]), 0);
+        let mut state = runtime(layer_config(&[("rofi", 0)]), 0);
         state.handle_event(Event::ActiveWindowV2 {
             addr: WindowAddr(1),
         });
@@ -973,6 +1275,7 @@ mod tests {
         assert!(state
             .resync(
                 Some((WindowAddr(1), "firefox".to_string())),
+                "kbd",
                 0,
                 &[WindowAddr(1)],
                 &["rofi".to_string()],
@@ -986,11 +1289,12 @@ mod tests {
 
     #[test]
     fn resync_adopts_startup_layer_without_polluting_window() {
-        let mut state = RuntimeState::new(layer_config(&[("rofi", 1)]), 0);
+        let mut state = runtime(layer_config(&[("rofi", 1)]), 0);
 
         assert!(state
             .resync(
                 Some((WindowAddr(1), "codium".to_string())),
+                "kbd",
                 0,
                 &[WindowAddr(1)],
                 &["rofi".to_string()],
@@ -1007,13 +1311,13 @@ mod tests {
 
     #[test]
     fn resync_prunes_closed_windows() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[]), 0);
+        let mut state = runtime(config(&["kbd"], &[]), 0);
         state.handle_event(Event::ActiveWindowV2 {
             addr: WindowAddr(1),
         });
         state.record_keyboard_layout("kbd", 1);
 
-        assert!(state.resync(None, 0, &[], &[]).is_empty());
+        assert!(state.resync(None, "kbd", 0, &[], &[]).is_empty());
 
         // Window 1 is gone; re-seeing its address treats it as new.
         assert!(state
@@ -1026,7 +1330,7 @@ mod tests {
 
     #[test]
     fn resync_restores_known_active_window() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[]), 0);
+        let mut state = runtime(config(&["kbd"], &[]), 0);
         state.handle_event(Event::ActiveWindowV2 {
             addr: WindowAddr(1),
         });
@@ -1035,6 +1339,7 @@ mod tests {
         assert_eq!(
             state.resync(
                 Some((WindowAddr(1), "firefox".to_string())),
+                "kbd",
                 0,
                 &[WindowAddr(1)],
                 &[]
@@ -1049,11 +1354,12 @@ mod tests {
 
     #[test]
     fn resync_learns_unknown_active_window_without_switching() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[("firefox", 0)]), 0);
+        let mut state = runtime(config(&["kbd"], &[("firefox", 0)]), 0);
 
         assert!(state
             .resync(
                 Some((WindowAddr(7), "firefox".to_string())),
+                "kbd",
                 1,
                 &[WindowAddr(7)],
                 &[]
@@ -1065,7 +1371,7 @@ mod tests {
 
     #[test]
     fn resync_clears_pending_echoes() {
-        let mut state = RuntimeState::new(config(&["kbd"], &[("firefox", 1)]), 0);
+        let mut state = runtime(config(&["kbd"], &[("firefox", 1)]), 0);
         state.handle_event(Event::ActiveWindow {
             class_name: "firefox",
         });
@@ -1075,6 +1381,7 @@ mod tests {
 
         state.resync(
             Some((WindowAddr(1), "firefox".to_string())),
+            "kbd",
             1,
             &[WindowAddr(1)],
             &[],
