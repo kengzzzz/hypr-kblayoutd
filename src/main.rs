@@ -29,8 +29,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ipc = HyprlandIpc::new(paths);
 
     let layout_count = ipc.configured_layout_count()?;
-    if layout_count < 2 && !ipc.kb_file_is_set()? {
-        return Err("Hyprland needs at least two configured keyboard layouts".into());
+    // kb_file overrides kb_layout, so the count is unreliable when set.
+    if !ipc.kb_file_is_set()? {
+        if layout_count < 2 {
+            return Err("Hyprland needs at least two configured keyboard layouts".into());
+        }
+        for (section, key, layout) in config.layouts_out_of_range(layout_count) {
+            log::warn!(
+                "{section} {key:?} uses layout {layout}, but input:kb_layout has only {layout_count} layouts"
+            );
+        }
     }
 
     let (initial_keyboard, initial_layout) = ipc.current_active_keyboard()?;

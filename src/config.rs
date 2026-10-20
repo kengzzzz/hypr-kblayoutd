@@ -1,5 +1,6 @@
+use serde::de::IgnoredAny;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -7,7 +8,15 @@ use std::path::{Path, PathBuf};
 
 use crate::state::LayoutIndex;
 
-const DEFAULT_EXCLUDES: &[&str] = &["wlr_virtual_keyboard_v", "yubikey"];
+const DEFAULT_EXCLUDES: &[&str] = &[
+    "wlr_virtual_keyboard_v",
+    "yubikey",
+    "power-button",
+    "sleep-button",
+    "video-bus",
+    "consumer-control",
+    "system-control",
+];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
@@ -52,11 +61,14 @@ impl Default for KeyboardConfig {
     }
 }
 
+// Unknown keys are warned about, not rejected: an error would restart-loop under systemd.
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     keyboards: Option<RawKeyboardConfig>,
     default_layouts: Option<HashMap<String, u16>>,
     layer_layouts: Option<HashMap<String, u16>>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, IgnoredAny>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -64,6 +76,8 @@ struct RawKeyboardConfig {
     #[serde(default)]
     include: Vec<String>,
     exclude_contains: Option<Vec<String>>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, IgnoredAny>,
 }
 
 pub fn default_config_path() -> Option<PathBuf> {
@@ -90,6 +104,9 @@ pub fn load_optional(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
 
 pub fn parse(input: &str) -> Result<Config, ConfigError> {
     let raw: RawConfig = toml::from_str(input).map_err(ConfigError::Parse)?;
+    for key in unknown_keys(&raw) {
+        log::warn!("ignoring unknown config key {key:?}");
+    }
     let raw_keyboards = raw.keyboards.unwrap_or_default();
     let default_layouts = layout_map(raw.default_layouts.unwrap_or_default())?;
     let layer_layouts = layout_map(raw.layer_layouts.unwrap_or_default())?;
@@ -106,6 +123,16 @@ pub fn parse(input: &str) -> Result<Config, ConfigError> {
     })
 }
 
+fn unknown_keys(raw: &RawConfig) -> Vec<String> {
+    let top = raw.unknown.keys().cloned();
+    let keyboards = raw
+        .keyboards
+        .iter()
+        .flat_map(|keyboards| keyboards.unknown.keys())
+        .map(|key| format!("keyboards.{key}"));
+    top.chain(keyboards).collect()
+}
+
 fn layout_map(raw: HashMap<String, u16>) -> Result<HashMap<String, LayoutIndex>, ConfigError> {
     raw.into_iter()
         .map(|(key, value)| {
@@ -117,6 +144,29 @@ fn layout_map(raw: HashMap<String, u16>) -> Result<HashMap<String, LayoutIndex>,
             Ok((key, index))
         })
         .collect()
+}
+
+impl Config {
+    pub fn layouts_out_of_range(
+        &self,
+        layout_count: usize,
+    ) -> Vec<(&'static str, &str, LayoutIndex)> {
+        let sections = [
+            ("default_layouts", &self.default_layouts),
+            ("layer_layouts", &self.layer_layouts),
+        ];
+        let mut out: Vec<_> = sections
+            .into_iter()
+            .flat_map(|(section, layouts)| {
+                layouts
+                    .iter()
+                    .filter(|(_, layout)| usize::from(**layout) >= layout_count)
+                    .map(move |(key, layout)| (section, key.as_str(), *layout))
+            })
+            .collect();
+        out.sort();
+        out
+    }
 }
 
 impl KeyboardConfig {
@@ -180,6 +230,65 @@ mod tests {
         .unwrap();
 
         assert!(cfg.layer_layouts.is_empty());
+    }
+
+    #[test]
+    fn default_excludes_skip_non_typing_devices() {
+        let cfg = Config::default();
+
+        for device in [
+            "power-button",
+            "power-button-1",
+            "video-bus",
+            "c-media-electronics-inc.-usb-advanced-audio-device-consumer-control",
+            "logitech-usb-receiver-system-control",
+        ] {
+            assert!(cfg.keyboards.is_excluded(device), "{device}");
+        }
+        assert!(!cfg.keyboards.is_excluded("keychron-keychron-k2"));
+    }
+
+    #[test]
+    fn unknown_keys_are_reported_but_not_rejected() {
+        let input = r#"
+            [keyboard]
+            include = ["kbd"]
+
+            [keyboards]
+            exclude = ["virtual"]
+
+            [layer_layouts]
+            "rofi" = 0
+        "#;
+        let raw: RawConfig = toml::from_str(input).unwrap();
+
+        assert_eq!(unknown_keys(&raw), ["keyboard", "keyboards.exclude"]);
+        assert_eq!(parse(input).unwrap().layer_layouts["rofi"], 0);
+    }
+
+    #[test]
+    fn reports_layouts_beyond_configured_count() {
+        let cfg = parse(
+            r#"
+                [default_layouts]
+                "firefox" = 0
+                "discord" = 2
+
+                [layer_layouts]
+                "rofi" = 1
+                "wofi" = 3
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.layouts_out_of_range(2),
+            [
+                ("default_layouts", "discord", 2),
+                ("layer_layouts", "wofi", 3)
+            ]
+        );
+        assert!(cfg.layouts_out_of_range(4).is_empty());
     }
 
     #[test]
