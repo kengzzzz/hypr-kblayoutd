@@ -1,8 +1,8 @@
 # Benchmark Notes
 
-These measurements were taken on 2026-05-18 in a live Hyprland session with `kb_layout = us,th` and ten devices reported under `keyboards` by `hyprctl devices -j`.
+Measured 2026-05-18 in a live Hyprland session: `kb_layout = us,th`, ten keyboards in `hyprctl devices -j`.
 
-The benchmark compared spawning `hyprctl` with sending the same commands directly to Hyprland's `.socket.sock`.
+Spawning `hyprctl` vs. writing the same command to `.socket.sock`:
 
 | Operation | Mean | p50 | p95 |
 | --- | ---: | ---: | ---: |
@@ -13,7 +13,7 @@ The benchmark compared spawning `hyprctl` with sending the same commands directl
 | `hyprctl switchxkblayout` for ten keyboard entries | 11429 us | 11425 us | 12335 us |
 | direct `switchxkblayout` for ten keyboard entries | 57 us | 58 us | 64 us |
 
-Microbenchmarks also checked event parsing and state choices:
+Event parsing and state microbenchmarks:
 
 | Operation | Result |
 | --- | --- |
@@ -30,14 +30,14 @@ Microbenchmarks also checked event parsing and state choices:
 
 Decisions:
 
-- Use direct Hyprland IPC. This is the only measured optimization with a large latency impact.
-- Raw Hyprland command IPC for `switchxkblayout` does not use the `--` separator that may appear in CLI-style usage. The verified direct IPC request format is `switchxkblayout <keyboard> <index>`.
-- Use a single plain runtime state struct instead of global mutexes. The performance win is small, but the design is simpler and avoids lock lifetime mistakes.
-- Use low-allocation event parsing and numeric window addresses. This is simple and removes avoidable hot-path allocations.
-- Precompute default layouts by class in a `HashMap`. Small configs do not need it for speed, but it keeps the runtime path simple and scales better for large configs.
-- Do not add more micro-optimizations unless a new benchmark shows a real bottleneck.
+- Direct IPC: the only change with a large latency win.
+- Raw IPC `switchxkblayout` takes no `--` separator: `switchxkblayout <keyboard> <index>`.
+- One plain state struct, no global mutexes: simpler, no lock-lifetime bugs.
+- Allocation-free parsing and numeric window addresses on the hot path.
+- Class defaults in a `HashMap`: not needed for speed at small sizes, but scales.
+- No more micro-optimizations without a benchmark showing a bottleneck.
 
-Direct IPC format verification:
+Raw IPC request formats:
 
 | Request | Result |
 | --- | --- |
@@ -46,7 +46,7 @@ Direct IPC format verification:
 | `/dispatch switchxkblayout keychron-keychron-k2 0` | `Invalid dispatcher` |
 | `switchxkblayout keychron-keychron-k2 0` | `ok` |
 
-Known follow-up items:
+Follow-ups:
 
-- The current window default-layout path relies on Hyprland sending `activewindow` before the matching `activewindowv2`. Keep this simple unless real testing shows ordering problems. TODO: either use `openwindow` to maintain an address-to-class map, or query `j/clients` when a new address is seen without a reliable class.
-- Socket paths are discovered once at startup. If reconnect repeatedly fails after a Hyprland restart or instance path change, rediscover `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE` before the next reconnect attempt.
+- Class defaults rely on `activewindow` arriving before its `activewindowv2`. If that ever breaks, track classes from `openwindow` or query `j/clients` for unknown addresses.
+- Socket paths are found once at startup. If reconnects keep failing after a Hyprland restart, rediscover them before retrying.

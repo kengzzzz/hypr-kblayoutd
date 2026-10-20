@@ -29,8 +29,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ipc = HyprlandIpc::new(paths);
 
     let layout_count = ipc.configured_layout_count()?;
-    if layout_count < 2 && !ipc.kb_file_is_set()? {
-        return Err("Hyprland needs at least two configured keyboard layouts".into());
+    // kb_file overrides kb_layout, so the count is unreliable when set.
+    if !ipc.kb_file_is_set()? {
+        if layout_count < 2 {
+            return Err("Hyprland needs at least two configured keyboard layouts".into());
+        }
+        for (section, key, layout) in config.layouts_out_of_range(layout_count) {
+            log::warn!(
+                "{section} {key:?} uses layout {layout}, but input:kb_layout has only {layout_count} layouts"
+            );
+        }
     }
 
     let (initial_keyboard, initial_layout) = ipc.current_active_keyboard()?;
@@ -74,8 +82,7 @@ fn reconnect_delay(backoff: &mut Duration, connected: bool) -> Duration {
     delay
 }
 
-// Events can be missed at startup and while the event socket is down, so
-// re-align window/layout state with Hyprland before (re)attaching.
+// Events are missed at startup and while disconnected, so resync before (re)attaching.
 fn resync_state(ipc: &HyprlandIpc, state: &mut RuntimeState) {
     let queried = ipc
         .current_active_keyboard()
@@ -364,8 +371,7 @@ mod tests {
         let mut queries = 0;
         let mut waits = 0;
 
-        // An unchanged snapshot is ambiguous: it can be a buffered close or
-        // an animating close. After retries, the close event wins.
+        // A stale snapshot may be a buffered or an animating close. After retries the event wins.
         let actions = handle_event_with_layer_snapshot(
             &mut state,
             event::Event::CloseLayer { namespace: "rofi" },

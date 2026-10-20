@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
-# Sync hypr-kblayoutd-bin's PKGBUILD to a published release: rewrite pkgver,
-# pull the per-arch sha256sums from the release's sha256sums.txt, and
-# regenerate .SRCINFO. Needs curl and makepkg (no compiler).
-#
-# Usage: contrib/update-bin-pkgbuild.sh <version> [pkgbuild-dir]
-#   e.g. contrib/update-bin-pkgbuild.sh 0.2.1 ~/Documents/aur/hypr-kblayoutd-bin
+# Points the -bin PKGBUILD at a published release: sets pkgver, fetches both
+# checksums and regenerates .SRCINFO. Needs curl and makepkg.
+# Usage: packaging/update-bin-pkgbuild.sh <version> [pkgbuild-dir=packaging/aur-bin]
 
 set -euo pipefail
 
 readonly REPO="kengzzzz/hypr-kblayoutd"
 readonly PKGNAME="hypr-kblayoutd"
 
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 ver="${1:-}"
-dir="${2:-$HOME/Documents/aur/hypr-kblayoutd-bin}"
+dir="${2:-$root/packaging/aur-bin}"
 
 if [ -z "$ver" ]; then
   echo "usage: ${0##*/} <version> [pkgbuild-dir]" >&2
@@ -53,4 +51,4 @@ echo "updated $pkgbuild to $ver"
 echo "  x86_64  $sum_x86_64"
 echo "  aarch64 $sum_aarch64"
 echo
-echo "review, then: cd $dir && git commit -am 'upgpkg: $ver' && git push"
+echo "review, then publish it as described in packaging/README.md"

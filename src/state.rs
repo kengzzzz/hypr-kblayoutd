@@ -42,10 +42,9 @@ pub struct RuntimeState {
     exclude_contains: Vec<String>,
     defaults_by_class: HashMap<String, LayoutIndex>,
     default_patterns: Vec<(Regex, LayoutIndex)>,
-    // Keyed by namespace, not address: a launcher gets a fresh surface on
-    // every open but should keep its layout across them.
+    // Keyed by namespace: a launcher gets a new surface on every open.
     layers: HashMap<String, LayoutIndex>,
-    // Tracked namespaces currently holding keyboard focus, innermost last.
+    // Tracked namespaces holding keyboard focus, innermost last.
     focused_layers: Vec<String>,
     layer_defaults: HashMap<String, LayoutIndex>,
     layer_patterns: Vec<(Regex, LayoutIndex)>,
@@ -169,8 +168,6 @@ impl RuntimeState {
         log::debug!("keyboard seeded: keyboard={keyboard} layout={layout}");
     }
 
-    /// Re-align state with Hyprland after events may have been missed
-    /// (startup, or a gap while the event socket was down).
     pub fn resync(
         &mut self,
         active: Option<(WindowAddr, String)>,
@@ -196,8 +193,7 @@ impl RuntimeState {
                 match self.windows.get(&addr).copied() {
                     Some(remembered) => Some(remembered),
                     None => {
-                        // The active layout belongs to the layer when one is
-                        // mapped, so do not learn it for the window underneath.
+                        // The active layout belongs to the mapped layer, not this window.
                         let layout = if layer_target.is_some() {
                             self.default_layout_for_active_class()
                         } else {
@@ -290,8 +286,7 @@ impl RuntimeState {
         self.switch_actions(target)
     }
 
-    /// Reconcile a layer event without importing unrelated entries from
-    /// `j/layers`, which can include surfaces running their exit animation.
+    /// Applies a layer event without importing other `j/layers` entries, which may be fading out.
     pub fn reconcile_layer_event(
         &mut self,
         namespace: &str,
@@ -303,7 +298,6 @@ impl RuntimeState {
             *remaining.entry(live.as_str()).or_default() += 1;
         }
 
-        // Prune known layers from the snapshot without importing unknown ones.
         let mut logical = Vec::with_capacity(self.focused_layers.len() + 1);
         for focused in &self.focused_layers {
             let Some(count) = remaining.get_mut(focused.as_str()) else {
@@ -453,8 +447,7 @@ impl RuntimeState {
                 own_echo = true;
                 break;
             }
-            // A switch from an unknown prior layout may not emit an event. If
-            // it does not match this event, discard it and inspect the next.
+            // A switch from an unknown layout may emit no event, so drop it and check the next.
         }
         if pending.is_empty() {
             self.pending_switches.remove(keyboard);
@@ -559,10 +552,8 @@ impl RuntimeState {
     }
 }
 
-// Every configured key is also usable as an anchored regex, matched only
-// when no exact entry fits. Sorted by pattern text so overlapping patterns
-// resolve the same way on every run. Keys that fail to compile (stray
-// parens etc.) still work as exact matches, so this never rejects a config.
+// Keys double as anchored regexes, tried only when no exact key matches. Sorted so
+// overlapping patterns resolve deterministically. Invalid regexes stay exact-only.
 fn compile_patterns(
     defaults: &HashMap<String, LayoutIndex>,
     section: &str,
@@ -765,8 +756,7 @@ mod tests {
     fn global_layout_match_does_not_skip_other_managed_keyboards() {
         let mut state = runtime(config(&["kbd-a", "kbd-b"], &[("firefox", 1)]), 0);
 
-        // Only kbd-b changed. The global state now says 1, but kbd-a is
-        // still at 0 and needs the next restoration command.
+        // Only kbd-b moved to 1. kbd-a is still 0 and must still be switched.
         state.record_keyboard_layout("kbd-b", 1);
         state.handle_event(Event::ActiveWindow {
             class_name: "firefox",
@@ -844,8 +834,7 @@ mod tests {
             }]
         );
 
-        // kbd-a changed to 0 and emitted an echo. kbd-b was already at 0,
-        // so it was not sent a redundant command and has no pending echo.
+        // Only kbd-a was switched, so only kbd-a expects an echo.
         assert_eq!(
             state.handle_event(Event::ActiveLayout {
                 keyboard: "kbd-a",
@@ -878,8 +867,7 @@ mod tests {
             class_name: "firefox",
         });
 
-        // kbd-b's actual layout is already 1, but it is not known yet. The
-        // command succeeds silently and leaves an uncertain pending switch.
+        // kbd-b is already 1 but untracked: its switch is silent and stays pending.
         assert_eq!(
             state.handle_event(Event::ActiveWindowV2 {
                 addr: WindowAddr(1)
@@ -966,8 +954,7 @@ mod tests {
         });
         state.handle_event(Event::EmptyActiveWindow);
 
-        // A manual layout change on an empty workspace must not resurrect
-        // the closed window's entry.
+        // Must not resurrect the closed window's entry.
         state.record_keyboard_layout("kbd", 1);
 
         assert_eq!(
@@ -1191,7 +1178,7 @@ mod tests {
             .sync_layers(&layer_snapshot(&["rofi", "rofi"]))
             .is_empty());
 
-        // One rofi surface remains mapped, so the window must not be restored.
+        // One rofi is still mapped, so the window is not restored yet.
         assert!(state.sync_layers(&layer_snapshot(&["rofi"])).is_empty());
         assert_eq!(state.active_layout(), 0);
 
@@ -1258,7 +1245,6 @@ mod tests {
         );
         state.record_keyboard_layout("kbd", 0);
 
-        // Focus is on the window again, so layout changes land on the window.
         state.record_keyboard_layout("kbd", 1);
         assert_eq!(state.active_window_layout(), Some(1));
     }
@@ -1301,7 +1287,7 @@ mod tests {
             )
             .is_empty());
         assert_eq!(state.active_window_layout(), Some(0));
-        // A buffered open event after connect must not double-count the layer.
+        // A buffered open event must not double-count the layer.
         assert!(state.sync_layers(&layer_snapshot(&["rofi"])).is_empty());
 
         state.record_keyboard_layout("kbd", 1);
@@ -1319,7 +1305,7 @@ mod tests {
 
         assert!(state.resync(None, "kbd", 0, &[], &[]).is_empty());
 
-        // Window 1 is gone; re-seeing its address treats it as new.
+        // resync forgot window 1, so it is new again.
         assert!(state
             .handle_event(Event::ActiveWindowV2 {
                 addr: WindowAddr(1)

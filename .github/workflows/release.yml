@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify tag matches Cargo.toml version
+      - name: Verify tag matches Cargo.toml version and CHANGELOG.md
         run: |
           tag="${GITHUB_REF_NAME#v}"
           crate="$(sed -n '/^\[package\]/,/^\[/ s/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
@@ -36,6 +36,7 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $crate" >&2
             exit 1
           fi
+          ci/release-notes.sh "$tag" > /dev/null
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
@@ -51,7 +52,7 @@ jobs:
           dir="hypr-kblayoutd-${ver}-${{ matrix.arch }}"
           mkdir -p "stage/$dir"
           cp target/release/hypr-kblayoutd "stage/$dir/"
-          cp -r contrib docs README.md LICENSE "stage/$dir/"
+          cp -r contrib docs README.md CHANGELOG.md LICENSE "stage/$dir/"
           tar -C stage -czf "${dir}.tar.gz" "$dir"
 
       - uses: actions/upload-artifact@v4
@@ -64,20 +65,25 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: tarball-*
+          path: dist
           merge-multiple: true
 
       - name: Checksums
-        run: sha256sum *.tar.gz | tee sha256sums.txt
+        working-directory: dist
+        run: sha256sum -- *.tar.gz | tee sha256sums.txt
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          ci/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            *.tar.gz sha256sums.txt
+            --notes-file notes.md \
+            dist/*.tar.gz dist/sha256sums.txt
