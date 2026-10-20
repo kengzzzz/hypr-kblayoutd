@@ -23,11 +23,8 @@ in
       inherit (toml) type;
       default = { };
       example = {
-        keyboards.exclude_contains = [
-          "wlr_virtual_keyboard_v"
-          "yubikey"
-        ];
         default_layouts.firefox = 0;
+        layer_layouts.rofi = 0;
       };
       description = ''
         Settings written to

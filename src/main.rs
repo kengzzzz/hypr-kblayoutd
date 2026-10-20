@@ -82,8 +82,7 @@ fn reconnect_delay(backoff: &mut Duration, connected: bool) -> Duration {
     delay
 }
 
-// Events can be missed at startup and while the event socket is down, so
-// re-align window/layout state with Hyprland before (re)attaching.
+// Events are missed at startup and while disconnected, so resync before (re)attaching.
 fn resync_state(ipc: &HyprlandIpc, state: &mut RuntimeState) {
     let queried = ipc
         .current_active_keyboard()
@@ -372,8 +371,7 @@ mod tests {
         let mut queries = 0;
         let mut waits = 0;
 
-        // An unchanged snapshot is ambiguous: it can be a buffered close or
-        // an animating close. After retries, the close event wins.
+        // A stale snapshot may be a buffered or an animating close. After retries the event wins.
         let actions = handle_event_with_layer_snapshot(
             &mut state,
             event::Event::CloseLayer { namespace: "rofi" },
